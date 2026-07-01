@@ -3884,6 +3884,8 @@ dependencies = [
  "compose-tracing",
  "compose-transport",
  "prometheus-client",
+ "reqwest",
+ "serde_json",
  "tokio",
  "tracing",
 ]

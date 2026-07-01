@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use compose_config::SidecarArgs;
+use compose_config::{MockProofArgs, SidecarArgs};
 use compose_coordinator::builder::CoordinatorBuilder;
 use compose_coordinator::builder_client::HttpXtBuilderClient;
 use compose_coordinator::coordinator::{DefaultCoordinator, VerificationConfig};
@@ -46,6 +46,10 @@ async fn main() -> Result<()> {
 
     if let Some(client) = quic_client {
         spawn_publisher_connection(coordinator_arc.clone(), client);
+    }
+
+    if args.mock_proof.enabled {
+        spawn_mock_proof_submitter(args.chain.id, args.mock_proof.clone());
     }
 
     let state = AppState::from_arc(coordinator_arc).with_registry(registry);
@@ -206,6 +210,74 @@ fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<
         }
 
         warn!("Publisher receive loop ended");
+    });
+}
+
+/// Stands in for a real op-succinct prover: periodically POSTs a
+/// fabricated-but-well-formed proof submission to the publisher's
+/// `/v1/proofs/op-succinct` endpoint for this sidecar's own chain. The
+/// publisher never validates proof content itself (see the "not our job,
+/// L1 does it" TODO in `receive_proof`), and the `superblock_number` field
+/// is likewise ignored by the publisher — it always finalizes against its
+/// own locally tracked `next_superblock_number` once every registered chain
+/// has submitted something for the current round. Pairs with a
+/// `MockVerifier` contract on L1 that accepts any proof unconditionally, so
+/// the full pipeline (including the L1 submission) can be exercised without
+/// running a real ZK prover.
+fn spawn_mock_proof_submitter(chain_id: u64, cfg: MockProofArgs) {
+    if cfg.publisher_http_addr.is_empty() {
+        warn!("mock-proof.enabled is set but publisher-http-addr is empty, not starting submitter");
+        return;
+    }
+
+    let url = format!("http://{}/v1/proofs/op-succinct", cfg.publisher_http_addr);
+    let interval = Duration::from_secs(cfg.interval_secs.max(1));
+
+    tokio::spawn(async move {
+        info!(url, interval_secs = cfg.interval_secs, "Starting mock proof submitter");
+        let client = reqwest::Client::new();
+        let mut ticker = tokio::time::interval(interval);
+        let mut round: u64 = 0;
+
+        loop {
+            ticker.tick().await;
+            round += 1;
+
+            // Non-zero, chain- and round-distinguishable placeholder values.
+            // Content is never cryptographically checked anywhere in this
+            // mock pipeline — only `l1_head != 0` is enforced by the
+            // publisher's handler.
+            let word = |tag: u64| format!("0x{:064x}", chain_id * 1_000_000_000 + round * 1000 + tag);
+            let addr = |tag: u64| format!("0x{:040x}", chain_id * 1_000_000_000 + round * 1000 + tag);
+
+            let body = serde_json::json!({
+                "superblock_number": round,
+                "chain_id": chain_id,
+                "aggregation_outputs": {
+                    "l1Head": word(1),
+                    "l2PreRoot": word(2),
+                    "l2PostRoot": word(3),
+                    "l2BlockNumber": round,
+                    "rollupConfigHash": word(4),
+                    "mailboxRoot": word(5),
+                    "multiBlockVKey": word(6),
+                    "proverAddress": addr(7),
+                },
+                "agg_vkey_hash": word(8),
+            });
+
+            match client.post(&url).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(round, "Mock proof submitted");
+                }
+                Ok(resp) => {
+                    warn!(round, status = %resp.status(), "Mock proof submission rejected");
+                }
+                Err(e) => {
+                    warn!(round, error = %e, "Mock proof submission failed");
+                }
+            }
+        }
     });
 }
 

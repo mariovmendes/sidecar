@@ -30,6 +30,9 @@ pub struct SidecarArgs {
 
     #[command(flatten)]
     pub verification: VerificationArgs,
+
+    #[command(flatten)]
+    pub mock_proof: MockProofArgs,
 }
 
 /// HTTP server settings.
@@ -205,6 +208,48 @@ pub struct VerificationArgs {
     pub timeout_ms: u64,
 }
 
+/// Mock proof generation (stands in for a real op-succinct prover).
+///
+/// When enabled, this sidecar periodically submits a fabricated-but-well-formed
+/// proof for its own chain to the publisher's `/v1/proofs/op-succinct` HTTP
+/// endpoint, so the publisher's proof-collection window can be satisfied
+/// without running a real ZK prover. Pairs with a `MockVerifier` deployed on
+/// L1 (which accepts any proof unconditionally) so the full pipeline —
+/// including the L1 submission — can be exercised end-to-end in local
+/// testing.
+#[derive(Debug, Clone, clap::Args)]
+pub struct MockProofArgs {
+    /// Enable mock proof submission.
+    #[arg(
+        id = "mock_proof_enabled",
+        long = "mock-proof.enabled",
+        env = "SIDECAR_MOCK_PROOF_ENABLED",
+        default_value = "false",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    pub enabled: bool,
+
+    /// Publisher HTTP API address (host:port) to submit mock proofs to.
+    #[arg(
+        long = "mock-proof.publisher-http-addr",
+        env = "SIDECAR_MOCK_PROOF_PUBLISHER_HTTP_ADDR",
+        default_value = ""
+    )]
+    pub publisher_http_addr: String,
+
+    /// Interval between mock proof submissions, in seconds. Should be <= the
+    /// publisher's consensus period duration so a proof is always ready
+    /// before the next period's collection window closes.
+    #[arg(
+        long = "mock-proof.interval-secs",
+        env = "SIDECAR_MOCK_PROOF_INTERVAL_SECS",
+        default_value = "60"
+    )]
+    pub interval_secs: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +264,8 @@ mod tests {
         assert_eq!(args.log.format, "json");
         assert!(!args.verification.enabled);
         assert_eq!(args.verification.url, "");
+        assert!(!args.mock_proof.enabled);
+        assert_eq!(args.mock_proof.interval_secs, 60);
     }
 
     #[test]
