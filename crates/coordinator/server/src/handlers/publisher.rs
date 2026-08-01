@@ -66,7 +66,7 @@ pub async fn handle_publisher_message(coordinator: Arc<DefaultCoordinator>, data
             debug!("Received vote from publisher (ignored by sidecar)");
         }
         Some(Payload::Confirmed(_)) =>{
-            debug!("Confirmed the inclusion of a cross-chain transaction")
+            debug!("Confirmed the inclusion of a cross-chain transaction");
         }
         other => {
             warn!(?other, "Unhandled publisher message type");

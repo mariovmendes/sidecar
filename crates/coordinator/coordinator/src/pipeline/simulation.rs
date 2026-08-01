@@ -518,6 +518,8 @@ impl DefaultCoordinator {
             }
 
             xt.simulated_at = Some(std::time::Instant::now());
+            let simulation_duration = xt.simulated_at.unwrap().duration_since(xt.created_at).as_secs_f64();
+            info!(instance_id,simulation_duration_ms = (simulation_duration * 1000.0) as u64,"Finished simulating cTx:");
             xt.vote_sent = true;
             xt.local_vote = Some(vote);
             xt.locked_chains.insert(self.chain_id);
