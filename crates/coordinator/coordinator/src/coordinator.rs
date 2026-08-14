@@ -38,6 +38,14 @@ pub struct VerificationConfig {
     pub timeout_ms: u64,
 }
 
+// Transaction chunks
+#[derive(Debug, Clone, Default)]
+pub struct TransactionChunk {
+    pub instance_id: String,
+    pub stage: u64,
+    pub transactions: Vec<Vec<u8>>,
+}
+
 /// Shared coordinator state protected by a `RwLock`.
 #[derive(Debug)]
 pub(crate) struct CoordinatorState {

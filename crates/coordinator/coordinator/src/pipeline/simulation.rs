@@ -29,7 +29,7 @@ impl DefaultCoordinator {
     ///
     /// Simulates transactions sequentially, discovers mailbox dependencies,
     /// waits for CIRC messages, and sends a vote.
-    pub(crate) async fn process_xt(&self, instance_id: &str) {
+    pub async fn process_xt(&self, instance_id: &str) {
         info!(instance_id, chain_id = %self.chain_id, "Processing XT");
 
         // Capture everything we need from state in a single read lock. Start
@@ -76,13 +76,6 @@ impl DefaultCoordinator {
             return;
         }
 
-        // Lock the local chain.
-        {
-            let mut state = self.state.write().await;
-            if let Some(xt) = state.pending.get_mut(instance_id) {
-                xt.locked_chains.insert(self.chain_id);
-            }
-        }
 
         let simulator = match &self.simulator {
             Some(s) => s.clone(),
@@ -196,6 +189,8 @@ impl DefaultCoordinator {
                             "Simulation waiting for mailbox dependencies"
                         );
 
+                        // TODO: Here because it is sequential, it will wait for the message to be received. Instead, I want to be able to pass to the processing
+                        // to the next transaction and only come back to this if an answer is received.
                         if !self
                             .wait_for_dependencies(instance_id, &result.dependencies)
                             .await

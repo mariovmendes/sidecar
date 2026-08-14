@@ -33,6 +33,7 @@ impl DefaultCoordinator {
 
         if !decision {
             for chain_id in &chain_ids {
+                // TODO: Remove this part
                 state.chain_overlay.remove(chain_id);
             }
         }

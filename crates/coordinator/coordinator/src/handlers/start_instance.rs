@@ -1,12 +1,13 @@
 //! Start-instance handling and sequencing validation.
 
 use std::collections::HashMap;
-
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
 use compose_primitives::{ChainId, InstanceId, PeriodId, SequenceNumber};
 use compose_proto::StartInstance;
 use tracing::{debug, error, info, warn};
 
-use crate::coordinator::DefaultCoordinator;
+use crate::coordinator::{DefaultCoordinator, TransactionChunk};
 use crate::model::pending_xt::PendingXt;
 use crate::pipeline::delivery::build_sender_nonce_cache;
 use crate::pipeline::submission::xt_request_fingerprint;
@@ -18,7 +19,7 @@ const MAX_PENDING_XTS: usize = 100;
 impl DefaultCoordinator {
     /// Process a new instance from the publisher. Validates the period and
     /// sequence, decodes transactions, and registers the XT.
-    pub async fn handle_start_instance(&self, msg: &StartInstance) -> Result<(), CoordinatorError> {
+    pub async fn handle_start_instance(&self, msg: &StartInstance, sender: &Sender<TransactionChunk>) -> Result<(), CoordinatorError> {
         let instance_id = InstanceId::from_publisher_bytes(&msg.instance_id);
         let xt_request = msg
             .xt_request
@@ -27,10 +28,12 @@ impl DefaultCoordinator {
 
         // Check if local chain participates.
         let mut includes_local = false;
+        let mut chain_bytes: Option<Vec<Vec<u8>>> = None;
         for req in &xt_request.transaction_requests {
             let chain_id = ChainId(req.chain_id);
             if chain_id == self.chain_id && !req.transaction.is_empty() {
                 includes_local = true;
+                chain_bytes = Some(req.transaction.clone());
                 break;
             }
         }
@@ -135,6 +138,7 @@ impl DefaultCoordinator {
         xt.raw_txs = raw_txs;
         xt.sender_nonces = sender_nonces;
 
+        // TODO: Remove this as there is no more chain locking.
         // Pre-lock so only one local simulation task claims this XT.
         if includes_local {
             xt.locked_chains.insert(self.chain_id);
@@ -189,17 +193,35 @@ impl DefaultCoordinator {
             }
         }
 
+        /* TODO: Understand better what this does. What are the waiters? Other processes that are waiting for the lock? */
         self.resolve_pending_submission(&fingerprint, Ok(instance_id.clone()))
             .await;
 
         if includes_local {
-            let coordinator = self.clone();
             let id = instance_id.clone();
-            self.task_tracker.spawn(async move {
-                coordinator.process_xt(&id).await;
-            });
+            if let Some(extracted_bytes) = chain_bytes {
+                match self.register_new_chunk(&sender, extracted_bytes, instance_id.to_string()).await {
+                    Ok(()) => {
+                        info!(instance_id = %id, "New chunk successfully registered");
+                    }
+                    Err(e) => {
+                        error!(error = %e, instance_id = %id, "Failed to register chunk, skipping XT processing");
+                    }
+                }
+            }
         }
 
+        Ok(())
+    }
+
+    async fn register_new_chunk(&self, sender: &Sender<TransactionChunk>, txs: Vec<Vec<u8>>, instance_id: String)
+     -> Result<(), mpsc::error::SendError<TransactionChunk>>{
+        let new_chunk = TransactionChunk{
+            instance_id,
+            stage: 1,
+            transactions: txs,
+        };
+        sender.send(new_chunk).await?;
         Ok(())
     }
 
@@ -229,10 +251,11 @@ impl DefaultCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
     use compose_primitives::{ChainId, PeriodId};
     use compose_proto::{StartInstance, TransactionRequest, XtRequest};
 
-    use crate::coordinator::{DefaultCoordinator, VerificationConfig};
+    use crate::coordinator::{DefaultCoordinator, TransactionChunk, VerificationConfig};
 
     fn start_instance(sequence_number: u64) -> StartInstance {
         StartInstance {
@@ -267,12 +290,14 @@ mod tests {
             state.current_period_id = PeriodId(1);
         }
 
+        let (tx, mut rx) = mpsc::channel::<TransactionChunk>(300);
+
         coordinator
-            .handle_start_instance(&start_instance(1))
+            .handle_start_instance(&start_instance(1), &tx)
             .await
             .unwrap();
         coordinator
-            .handle_start_instance(&start_instance(2))
+            .handle_start_instance(&start_instance(2), &tx)
             .await
             .unwrap();
 

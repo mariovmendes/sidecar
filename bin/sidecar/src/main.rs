@@ -8,7 +8,7 @@ use clap::Parser;
 use compose_config::{MockProofArgs, SidecarArgs};
 use compose_coordinator::builder::CoordinatorBuilder;
 use compose_coordinator::builder_client::HttpXtBuilderClient;
-use compose_coordinator::coordinator::{DefaultCoordinator, VerificationConfig};
+use compose_coordinator::coordinator::{DefaultCoordinator, TransactionChunk, VerificationConfig};
 use compose_mailbox::put_inbox::PutInboxTxBuilder;
 use compose_mailbox::queue::InMemoryQueue;
 use compose_metrics::SidecarMetrics;
@@ -26,6 +26,8 @@ use compose_transport::traits::Transport;
 use prometheus_client::registry::Registry;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -44,8 +46,11 @@ async fn main() -> Result<()> {
 
     let coordinator_arc = Arc::new(coordinator);
 
+    let (tx, rx) = mpsc::channel::<TransactionChunk>(300);
+
     if let Some(client) = quic_client {
-        spawn_publisher_connection(coordinator_arc.clone(), client);
+        spawn_publisher_connection(coordinator_arc.clone(), client, tx.clone());
+        spawn_chunk_processor(coordinator_arc.clone(), tx, rx);
     }
 
     if args.mock_proof.enabled {
@@ -91,6 +96,7 @@ fn build_coordinator(
     let has_mailbox = !universal_bridge_mailbox_address.is_empty();
     let has_key = !args.chain.coordinator_key.is_empty();
     if has_rpc && has_mailbox && has_key {
+        //TODO: Configure also removeInbox and check the universal if it is the same as the one developed
         match PutInboxTxBuilder::new(
             chain_id,
             chain_rpc.to_string(),
@@ -185,7 +191,7 @@ fn build_coordinator(
     Ok((builder.build()?, quic_client))
 }
 
-fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<QuicClient>) {
+fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<QuicClient>, tx: Sender<TransactionChunk>) {
     tokio::spawn(async move {
         info!("Connecting to publisher");
         if let Err(e) = client.connect_with_retry().await {
@@ -198,8 +204,9 @@ fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<
             match client.recv().await {
                 Ok(data) => {
                     let coord = coordinator.clone();
+                    let tx = tx.clone();
                     tokio::spawn(async move {
-                        handle_publisher_message(coord, data).await;
+                        handle_publisher_message(coord, data, tx).await;
                     });
                 }
                 Err(e) => {
@@ -210,6 +217,16 @@ fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<
         }
 
         warn!("Publisher receive loop ended");
+    });
+}
+
+fn spawn_chunk_processor(coordinator: Arc<DefaultCoordinator>, client: Sender<TransactionChunk>, mut rx: Receiver<TransactionChunk>){
+    tokio::spawn(async move {
+        info!("Starting chunk processor");
+        while let Some(cmd) = rx.recv().await {
+            warn!("{:?}", cmd);
+            coordinator.process_xt(&cmd.instance_id).await;
+        }
     });
 }
 
