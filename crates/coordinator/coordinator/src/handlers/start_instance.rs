@@ -1,13 +1,12 @@
 //! Start-instance handling and sequencing validation.
 
 use std::collections::HashMap;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 use compose_primitives::{ChainId, InstanceId, PeriodId, SequenceNumber};
 use compose_proto::StartInstance;
 use tracing::{debug, error, info, warn};
 
-use crate::coordinator::{DefaultCoordinator, TransactionChunk};
+use crate::coordinator::DefaultCoordinator;
 use crate::model::pending_xt::PendingXt;
 use crate::pipeline::delivery::build_sender_nonce_cache;
 use crate::pipeline::submission::xt_request_fingerprint;
@@ -19,7 +18,7 @@ const MAX_PENDING_XTS: usize = 100;
 impl DefaultCoordinator {
     /// Process a new instance from the publisher. Validates the period and
     /// sequence, decodes transactions, and registers the XT.
-    pub async fn handle_start_instance(&self, msg: &StartInstance, sender: &Sender<TransactionChunk>) -> Result<(), CoordinatorError> {
+    pub async fn handle_start_instance(&self, msg: &StartInstance, sender: &Sender<String>) -> Result<(), CoordinatorError> {
         let instance_id = InstanceId::from_publisher_bytes(&msg.instance_id);
         let xt_request = msg
             .xt_request
@@ -28,12 +27,10 @@ impl DefaultCoordinator {
 
         // Check if local chain participates.
         let mut includes_local = false;
-        let mut chain_bytes: Option<Vec<Vec<u8>>> = None;
         for req in &xt_request.transaction_requests {
             let chain_id = ChainId(req.chain_id);
             if chain_id == self.chain_id && !req.transaction.is_empty() {
                 includes_local = true;
-                chain_bytes = Some(req.transaction.clone());
                 break;
             }
         }
@@ -175,13 +172,16 @@ impl DefaultCoordinator {
             m.xt_pending_count.inc();
         }
 
+
+
+        // Release the write lock before spawning so register_xt can acquire it.
+        drop(state);
+
+        /*
         let local_submission = state
             .pending
             .get(&instance_id)
             .and_then(|xt| self.local_builder_submission(xt));
-
-        // Release the write lock before spawning so process_xt can acquire it.
-        drop(state);
 
         if let Some(submission) = local_submission {
             if let Err(err) = self.submit_xt_to_builder(submission).await {
@@ -191,37 +191,20 @@ impl DefaultCoordinator {
                 self.reject_start_instance(&instance_id, msg).await;
                 return Err(err);
             }
-        }
+        }*/
 
-        /* TODO: Understand better what this does. What are the waiters? Other processes that are waiting for the lock? */
         self.resolve_pending_submission(&fingerprint, Ok(instance_id.clone()))
             .await;
 
         if includes_local {
-            let id = instance_id.clone();
-            if let Some(extracted_bytes) = chain_bytes {
-                match self.register_new_chunk(&sender, extracted_bytes, instance_id.to_string()).await {
-                    Ok(()) => {
-                        info!(instance_id = %id, "New chunk successfully registered");
-                    }
-                    Err(e) => {
-                        error!(error = %e, instance_id = %id, "Failed to register chunk, skipping XT processing");
-                    }
-                }
+            let id = instance_id.to_string();
+            if let Err(e) = sender.send(id.clone()).await {
+                error!(error = %e, instance_id = %id, "Failed to enqueue new instance, skipping XT processing");
+            } else {
+                info!(instance_id = %id, "New instance signalled to chunk processor");
             }
         }
 
-        Ok(())
-    }
-
-    async fn register_new_chunk(&self, sender: &Sender<TransactionChunk>, txs: Vec<Vec<u8>>, instance_id: String)
-     -> Result<(), mpsc::error::SendError<TransactionChunk>>{
-        let new_chunk = TransactionChunk{
-            instance_id,
-            stage: 1,
-            transactions: txs,
-        };
-        sender.send(new_chunk).await?;
         Ok(())
     }
 
@@ -255,7 +238,7 @@ mod tests {
     use compose_primitives::{ChainId, PeriodId};
     use compose_proto::{StartInstance, TransactionRequest, XtRequest};
 
-    use crate::coordinator::{DefaultCoordinator, TransactionChunk, VerificationConfig};
+    use crate::coordinator::{DefaultCoordinator, VerificationConfig};
 
     fn start_instance(sequence_number: u64) -> StartInstance {
         StartInstance {
@@ -290,7 +273,7 @@ mod tests {
             state.current_period_id = PeriodId(1);
         }
 
-        let (tx, mut rx) = mpsc::channel::<TransactionChunk>(300);
+        let (tx, mut rx) = mpsc::channel::<String>(300);
 
         coordinator
             .handle_start_instance(&start_instance(1), &tx)

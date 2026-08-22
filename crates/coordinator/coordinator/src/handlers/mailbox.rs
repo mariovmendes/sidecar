@@ -1,19 +1,91 @@
 //! Inbound mailbox message handling and state updates.
 
+use compose_mailbox::wire;
+use compose_primitives::CrossRollupDependency;
 use compose_proto::MailboxMessage;
 use tracing::{debug, warn};
 
 use crate::coordinator::DefaultCoordinator;
 use compose_primitives_traits::CoordinatorError;
+use crate::coordinator::ChunkStage::{WaitingForMessages, WaitingForProcessing};
 
 impl DefaultCoordinator {
+    /// Handle an ACK `CrossRollupDependency` reported by a peer sidecar right
+    /// after it submitted the matching `receiveTokens`/`receiveETH`
+    /// transaction (`POST /mailbox/ack`).
+    ///
+    /// Does not submit anything to the builder inline from the HTTP request
+    /// path: records the dependency into `mailbox_messages` the same way an
+    /// inbound `/mailbox` message is recorded, then enqueues a
+    /// `TransactionChunk` at `WaitingForProcessing` so the chunk processor
+    /// picks it up and builds/submits the matching `putInbox` from there,
+    /// like every other chunk.
+    pub async fn handle_ack_dependency(
+        &self,
+        instance_id: String,
+        dependency: CrossRollupDependency,
+    ) -> Result<(), CoordinatorError> {
+        let mailbox_msg = MailboxMessage {
+            instance_id: instance_id.clone().into_bytes(),
+            source_chain: dependency.source_chain_id.0,
+            destination_chain: dependency.dest_chain_id.0,
+            sender: dependency.sender.as_slice().to_vec(),
+            receiver: dependency.receiver.as_slice().to_vec(),
+            label: String::from_utf8_lossy(&dependency.label).to_string(),
+            payload: dependency.data.unwrap_or_default(),
+            session_id: wire::encode_session_id(dependency.session_id),
+        };
+
+        let advanced = {
+            let mut state = self.state.write().await;
+            state
+                .mailbox_messages
+                .entry(instance_id.clone())
+                .or_default()
+                .push(mailbox_msg);
+
+            state.inflight_chunks.get_mut(instance_id.as_str()).is_some_and(|chunk| {
+                if chunk.stage == WaitingForMessages {
+                    chunk.stage = WaitingForProcessing;
+                    true
+                } else {
+                    false
+                }
+            })
+        };
+
+        match (advanced, &self.chunk_sender) {
+            (true, Some(sender)) => {
+                if let Err(e) = sender.send(instance_id.clone()).await {
+                    warn!(instance_id, error = %e, "Failed to enqueue ack chunk for processing");
+                }
+            }
+            (true, None) => {
+                warn!(instance_id, "No chunk sender configured, ack recorded but not scheduled for processing");
+            }
+            (false, _) => {
+                warn!(instance_id, "No inflight chunk found for ack, dropping");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Handle an incoming CIRC message from a peer sidecar.
     pub async fn handle_mailbox_message(
         &self,
         msg: &MailboxMessage,
     ) -> Result<(), CoordinatorError> {
+        // Publisher-assigned instance IDs are a raw SHA256 digest (see
+        // `generate_instance_id` in publisher's spec-sbcp), not UTF-8 text.
+        // Every other map (`state.pending`, `state.inflight_chunks`,
+        // `mailbox_index`) is keyed by `hex::encode` of that digest — see
+        // `InstanceId::from_publisher_bytes` — so recover the key the same
+        // way here instead of (incorrectly) UTF-8-decoding the raw bytes.
+        let instance_id = hex::encode(&msg.instance_id);
+
         debug!(
-            instance_id = %hex::encode(&msg.instance_id),
+            instance_id,
             source_chain = msg.source_chain,
             dest_chain = msg.destination_chain,
             label = %msg.label,
@@ -31,34 +103,41 @@ impl DefaultCoordinator {
             m.circ_messages_received_total.inc();
         }
 
-        let notify = {
+        // Record the message and, if the matching chunk is already sitting in
+        // WaitingForMessages (registered via register_xt, waiting on exactly
+        // this dependency), advance it and re-enqueue it — without holding the
+        // state lock across the channel send below.
+        let advanced = {
             let mut state = self.state.write().await;
-            if let Some(xt_id) = state.mailbox_index.get(&msg.instance_id).cloned() {
-                if let Some(xt) = state.pending.get_mut(&xt_id) {
-                    xt.pending_mailbox.push(msg.clone());
-                    debug!(
-                        instance_id = %xt_id,
-                        pending_count = xt.pending_mailbox.len(),
-                        "Added mailbox message to pending XT"
-                    );
+            state
+                .mailbox_messages
+                .entry(instance_id.clone())
+                .or_default()
+                .push(msg.clone());
+
+            state.inflight_chunks.get_mut(instance_id.as_str()).is_some_and(|chunk| {
+                if chunk.stage == WaitingForMessages {
+                    chunk.stage = WaitingForProcessing;
+                    true
+                } else {
+                    false
                 }
-            } else {
-                // XT not registered yet — buffer so it can be attached when
-                // the XT arrives.  This handles the race where sidecar-a's
-                // simulation completes in <1 ms and sends outbound mailbox
-                // messages to sidecar-b before the forwarded XT arrives.
-                warn!(
-                    instance_id = %hex::encode(&msg.instance_id),
-                    label = %msg.label,
-                    "Buffering mailbox message for unregistered XT"
-                );
-                state.buffer_orphan_mailbox(msg.clone());
-            }
-            state.mailbox_notify.clone()
+            })
         };
 
-        // Wake all simulations waiting on CIRC dependencies.
-        notify.notify_waiters();
+        match (advanced, &self.chunk_sender) {
+            (true, Some(sender)) => {
+                if let Err(e) = sender.send(instance_id.clone()).await {
+                    warn!(instance_id, error = %e, "Failed to enqueue chunk for processing");
+                }
+            }
+            (true, None) => {
+                warn!(instance_id, "No chunk sender configured, message recorded but not scheduled for processing");
+            }
+            (false, _) => {
+                debug!(instance_id, "No inflight chunk waiting on this instance yet");
+            }
+        }
 
         Ok(())
     }

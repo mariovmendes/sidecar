@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use compose_coordinator::coordinator::{DefaultCoordinator, TransactionChunk};
+use compose_coordinator::coordinator::DefaultCoordinator;
 use compose_primitives::{PeriodId, SuperblockNumber};
 use compose_proto::wire_message::Payload;
 use prost::Message;
@@ -11,7 +11,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, warn};
 
 /// Dispatch an inbound protobuf message from the publisher connection.
-pub async fn handle_publisher_message(coordinator: Arc<DefaultCoordinator>, data: Bytes, sender: Sender<TransactionChunk>) {
+pub async fn handle_publisher_message(coordinator: Arc<DefaultCoordinator>, data: Bytes, sender: Sender<String>) {
     let msg = match compose_proto::WireMessage::decode(data) {
         Ok(m) => m,
         Err(e) => {

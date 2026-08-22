@@ -10,7 +10,8 @@ use reqwest::Url;
 
 use compose_metrics::SidecarMetrics;
 use compose_primitives_traits::{
-    CoordinatorError, MailboxSender, PublisherClient, PutInboxBuilder, XtBuilderClient,
+    CoordinatorError, L2BridgeTxBuilder, MailboxSender, PublisherClient, PutInboxBuilder,
+    XtBuilderClient,
 };
 
 use crate::coordinator::{DefaultCoordinator, VerificationConfig};
@@ -24,6 +25,7 @@ pub struct CoordinatorBuilder {
     mailbox_queue: Option<Arc<dyn MailboxQueue>>,
     peer_coordinator: Option<Arc<dyn PeerCoordinator>>,
     put_inbox_builder: Option<Arc<dyn PutInboxBuilder>>,
+    l2_bridge_builder: Option<Arc<dyn L2BridgeTxBuilder>>,
     xt_builder_client: Option<Arc<dyn XtBuilderClient>>,
     metrics: Option<Arc<SidecarMetrics>>,
     circ_timeout_ms: u64,
@@ -49,6 +51,7 @@ impl CoordinatorBuilder {
             mailbox_queue: None,
             peer_coordinator: None,
             put_inbox_builder: None,
+            l2_bridge_builder: None,
             xt_builder_client: None,
             metrics: None,
             circ_timeout_ms: 10_000,
@@ -86,6 +89,11 @@ impl CoordinatorBuilder {
         self
     }
 
+    pub fn l2_bridge_builder(mut self, builder: Arc<dyn L2BridgeTxBuilder>) -> Self {
+        self.l2_bridge_builder = Some(builder);
+        self
+    }
+
     pub fn xt_builder_client(mut self, client: Arc<dyn XtBuilderClient>) -> Self {
         self.xt_builder_client = Some(client);
         self
@@ -120,6 +128,9 @@ impl CoordinatorBuilder {
         );
         if let Some(builder) = self.put_inbox_builder {
             coord.set_put_inbox_builder(builder);
+        }
+        if let Some(builder) = self.l2_bridge_builder {
+            coord.set_l2_bridge_builder(builder);
         }
         if let Some(client) = self.xt_builder_client {
             coord.set_xt_builder_client(client);

@@ -135,6 +135,14 @@ pub struct ChainArgs {
     )]
     pub universal_bridge_mailbox_address: String,
 
+    /// `ComposeL2ToL2Bridge` contract address.
+    #[arg(
+        long = "chain.l2-bridge-address",
+        env = "SIDECAR_L2_BRIDGE_ADDRESS",
+        default_value = ""
+    )]
+    pub l2_bridge_address: String,
+
     /// Private key for signing local `putInbox` transactions.
     #[arg(
         long = "chain.coordinator-key",

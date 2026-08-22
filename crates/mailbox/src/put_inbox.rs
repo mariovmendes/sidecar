@@ -93,18 +93,42 @@ impl PutInboxBuilder for PutInboxTxBuilder {
         dep: &CrossRollupDependency,
         nonce: u64,
     ) -> Result<Vec<u8>, CoordinatorError> {
-        let session_id = dep.session_id;
         let data = dep.data.as_deref().unwrap_or_default();
         let calldata = abi::encode_put_inbox(
             dep.source_chain_id.0,
             dep.sender,
             dep.receiver,
-            session_id,
+            dep.session_id,
             &dep.label,
             data,
         )
         .map_err(|e| CoordinatorError::Mailbox(format!("encode putInbox calldata: {e}")))?;
 
+        self.build_signed_tx(calldata, nonce).await
+    }
+
+    async fn build_remove_inbox_tx_with_nonce(
+        &self,
+        dep: &CrossRollupDependency,
+        nonce: u64,
+    ) -> Result<Vec<u8>, CoordinatorError> {
+        let data = dep.data.as_deref().unwrap_or_default();
+        let calldata = abi::encode_remove_inbox(
+            dep.source_chain_id.0,
+            dep.sender,
+            dep.receiver,
+            dep.session_id,
+            &dep.label,
+            data,
+        )
+        .map_err(|e| CoordinatorError::Mailbox(format!("encode removeInbox calldata: {e}")))?;
+
+        self.build_signed_tx(calldata, nonce).await
+    }
+}
+
+impl PutInboxTxBuilder {
+    async fn build_signed_tx(&self, calldata: Vec<u8>, nonce: u64) -> Result<Vec<u8>, CoordinatorError> {
         let tx = TransactionRequest::default()
             .with_from(self.signer_address)
             .with_to(self.mailbox_address)
@@ -123,11 +147,11 @@ impl PutInboxBuilder for PutInboxTxBuilder {
         let signed = provider
             .fill(tx)
             .await
-            .map_err(|e| CoordinatorError::Other(format!("fill putInbox tx: {e}")))?
+            .map_err(|e| CoordinatorError::Other(format!("fill mailbox tx: {e}")))?
             .try_into_envelope()
             .map_err(|e| {
                 CoordinatorError::Other(format!(
-                    "fill putInbox tx returned unsigned transaction: {:?}",
+                    "fill mailbox tx returned unsigned transaction: {:?}",
                     e.into_inner()
                 ))
             })?;

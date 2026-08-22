@@ -5,7 +5,11 @@ use crate::{
     model::pending_xt::PendingXt,
     pipeline::delivery::deps_for_chain,
 };
-use compose_primitives::CrossRollupDependency;
+use alloy::consensus::{Transaction, TxEnvelope};
+use alloy::rlp::Decodable;
+use alloy::sol_types::SolCall;
+use compose_mailbox::contract::writeMessageCall;
+use compose_primitives::{ChainId, CrossRollupDependency};
 use compose_primitives_traits::CoordinatorError;
 use tracing::{info, warn, error};
 
@@ -91,6 +95,16 @@ impl DefaultCoordinator {
         Ok(())
     }
 
+    pub(crate) async fn submit_unconfirmed_xt_to_builder(
+        &self,
+        xt: Vec<u8>,
+    ) -> Result<(), CoordinatorError> {
+        if let Some(builder) = &self.xt_builder_client {
+            builder.submit_tx(&xt).await?;
+        }
+        Ok(())
+    }
+
     async fn build_put_inbox_transactions(
         &self,
         dependencies: &[CrossRollupDependency],
@@ -143,6 +157,316 @@ impl DefaultCoordinator {
         }
 
         Ok(transactions)
+    }
+
+    pub(crate) async fn build_put_inbox_transaction(
+        &self,
+        dependency: &CrossRollupDependency,
+    ) -> Result<Vec<u8>, CoordinatorError> {
+        let builder = self
+            .put_inbox_builder
+            .as_ref()
+            .cloned()
+            .ok_or(CoordinatorError::PutInboxNotConfigured)?;
+        let nonce_builder = builder.clone();
+        let nonce = self
+            .nonce_manager
+            .reserve(1, move || {
+                let builder = nonce_builder.clone();
+                async move { builder.canonical_nonce_at().await }
+            })
+            .await?;
+
+        let build_started = std::time::Instant::now();
+        match builder.build_put_inbox_tx_with_nonce(dependency, nonce).await {
+            Ok(transaction) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .put_inbox_build_duration_seconds
+                        .observe(build_started.elapsed().as_secs_f64());
+                }
+                Ok(transaction)
+            }
+            Err(error) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .put_inbox_build_duration_seconds
+                        .observe(build_started.elapsed().as_secs_f64());
+                    metrics.put_inbox_build_error_total.inc();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn build_remove_inbox_transaction(
+        &self,
+        dependency: &CrossRollupDependency,
+    ) -> Result<Vec<u8>, CoordinatorError> {
+        let builder = self
+            .put_inbox_builder
+            .as_ref()
+            .cloned()
+            .ok_or(CoordinatorError::PutInboxNotConfigured)?;
+        let nonce_builder = builder.clone();
+        let nonce = self
+            .nonce_manager
+            .reserve(1, move || {
+                let builder = nonce_builder.clone();
+                async move { builder.canonical_nonce_at().await }
+            })
+            .await?;
+
+        builder.build_remove_inbox_tx_with_nonce(dependency, nonce).await
+    }
+
+    /// Builds and submits a `removeInbox` transaction that undoes a
+    /// previously-put inbox message once its bridging process is aborted
+    /// (compensating a `putInbox` the same way `unwrite` compensates a
+    /// `writeMessage`, per the Saga pattern in INTERLEAVED_BRIDGE.md).
+    /// `dependency.data` must be the exact payload originally passed to
+    /// `putInbox` for this key.
+    pub(crate) async fn submit_remove_inbox(
+        &self,
+        dependency: &CrossRollupDependency,
+    ) -> Result<(), CoordinatorError> {
+        let transaction = match self.build_remove_inbox_transaction(dependency).await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                    warn!(error = %resync_err, "Failed to resync putInbox nonce after removeInbox build error");
+                }
+                return Err(error);
+            }
+        };
+
+        if let Err(err) = self.submit_unconfirmed_xt_to_builder(transaction).await {
+            if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                warn!(error = %resync_err, "Failed to resync putInbox nonce after removeInbox submit error");
+            }
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    /// Decodes `tx_bytes` as a signed `writeMessage(Message)` transaction, derives the
+    /// resulting `CrossRollupDependency` from its header/payload, builds the matching
+    /// putInbox transaction, and submits it directly to the builder via
+    /// `eth_sendRawTransaction` (bypassing the batched `releaseXt` path).
+    pub(crate) async fn submit_put_inbox_for_tx(
+        &self,
+        tx_bytes: &Vec<u8>,
+    ) -> Result<(), CoordinatorError> {
+        let dependency = self.decode_write_message_dependency(tx_bytes)?;
+        self.submit_put_inbox_dependency(dependency).await
+    }
+
+    /// Builds and submits a putInbox transaction directly from an already-known
+    /// `CrossRollupDependency` (e.g. an ACK reported by a peer sidecar over HTTP),
+    /// skipping tx decoding entirely.
+    pub async fn handle_dependency(
+        &self,
+        dependency: CrossRollupDependency,
+    ) -> Result<(), CoordinatorError> {
+        self.submit_put_inbox_dependency(dependency).await
+    }
+
+    async fn submit_put_inbox_dependency(
+        &self,
+        dependency: CrossRollupDependency,
+    ) -> Result<(), CoordinatorError> {
+        let transaction = match self.build_put_inbox_transaction(&dependency).await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                    warn!(error = %resync_err, "Failed to resync putInbox nonce after build error");
+                }
+                return Err(error);
+            }
+        };
+
+        if let Err(err) = self.submit_unconfirmed_xt_to_builder(transaction).await {
+            if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                warn!(error = %resync_err, "Failed to resync putInbox nonce after submit error");
+            }
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn decode_write_message_dependency(
+        &self,
+        tx_bytes: &[u8],
+    ) -> Result<CrossRollupDependency, CoordinatorError> {
+        let signed: TxEnvelope = Decodable::decode(&mut &tx_bytes[..])
+            .map_err(|e| CoordinatorError::Other(format!("failed to decode tx: {e}")))?;
+
+        let input = signed.input();
+        if input.len() < 4 || input[..4] != writeMessageCall::SELECTOR {
+            return Err(CoordinatorError::Other(
+                "transaction is not a writeMessage call".to_string(),
+            ));
+        }
+
+        let call = writeMessageCall::abi_decode(input)
+            .map_err(|e| CoordinatorError::Other(format!("failed to decode writeMessage call: {e}")))?;
+        let header = &call.message.header;
+        let dest_chain_id = u64::try_from(header.chainDest)
+            .map_err(|_| CoordinatorError::Other("chainDest does not fit in u64".to_string()))?;
+
+        Ok(CrossRollupDependency {
+            source_chain_id: self.chain_id,
+            dest_chain_id: ChainId(dest_chain_id),
+            sender: header.sender,
+            receiver: header.receiver,
+            label: header.label.clone().into_bytes(),
+            data: Some(call.message.payload.to_vec()),
+            session_id: header.sessionId,
+        })
+    }
+
+    /// Reserve the next nonce for the shared coordinator signer (the same
+    /// account/nonce space used for `putInbox`) and build+submit an
+    /// `L2BridgeTxBuilder` transaction with it, resyncing the nonce on either
+    /// a build or submit failure.
+    async fn submit_l2_bridge_tx<F, Fut>(&self, build: F) -> Result<(), CoordinatorError>
+    where
+        F: FnOnce(std::sync::Arc<dyn compose_primitives_traits::L2BridgeTxBuilder>, u64) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<u8>, CoordinatorError>>,
+    {
+        let l2_builder = self
+            .l2_bridge_builder
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| CoordinatorError::Other("l2 bridge builder not configured".to_string()))?;
+        let builder = self
+            .xt_builder_client
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| CoordinatorError::Other("xt builder client not configured".to_string()))?;
+
+        let nonce_builder = l2_builder.clone();
+        let nonce = self
+            .nonce_manager
+            .reserve(1, move || {
+                let nonce_builder = nonce_builder.clone();
+                async move { nonce_builder.canonical_nonce_at().await }
+            })
+            .await?;
+
+        let tx = match build(l2_builder, nonce).await {
+            Ok(tx) => tx,
+            Err(error) => {
+                if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                    warn!(error = %resync_err, "Failed to resync coordinator nonce after l2 bridge build error");
+                }
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = builder.submit_tx(&tx).await {
+            if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                warn!(error = %resync_err, "Failed to resync coordinator nonce after l2 bridge submit error");
+            }
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    /// Submit `sendConfirm(sendHeader)` — sender-side finalize once the ACK
+    /// has been relayed back. `header` must be the exact header used when the
+    /// original SEND message was written.
+    pub(crate) async fn submit_send_confirm(
+        &self,
+        header: &CrossRollupDependency,
+    ) -> Result<(), CoordinatorError> {
+        let header = header.clone();
+        self.submit_l2_bridge_tx(move |builder, nonce| async move {
+            builder.build_send_confirm_tx(&header, nonce).await
+        })
+        .await
+    }
+
+    /// Submit `sendAbortToken(...)` — sender-side compensation for a rejected
+    /// ERC20/CET send, refunding `params.sender`.
+    pub(crate) async fn submit_send_abort_token(
+        &self,
+        params: &compose_primitives_traits::SendAbortTokenParams,
+    ) -> Result<(), CoordinatorError> {
+        let params = params.clone();
+        self.submit_l2_bridge_tx(move |builder, nonce| async move {
+            builder.build_send_abort_token_tx(&params, nonce).await
+        })
+        .await
+    }
+
+    /// Submit `sendAbortETH(...)` — sender-side compensation for a rejected
+    /// ETH send, refunding `params.sender`.
+    pub(crate) async fn submit_send_abort_eth(
+        &self,
+        params: &compose_primitives_traits::SendAbortEthParams,
+    ) -> Result<(), CoordinatorError> {
+        let params = params.clone();
+        self.submit_l2_bridge_tx(move |builder, nonce| async move {
+            builder.build_send_abort_eth_tx(&params, nonce).await
+        })
+        .await
+    }
+
+    /// Submit `recvConfirmToken(msgHeader)` — receiver-side finalize once the
+    /// SEND has been marked consumed. `header` is the header of the original
+    /// inbound SEND message.
+    pub(crate) async fn submit_recv_confirm_token(
+        &self,
+        header: &CrossRollupDependency,
+    ) -> Result<(), CoordinatorError> {
+        let header = header.clone();
+        self.submit_l2_bridge_tx(move |builder, nonce| async move {
+            builder.build_recv_confirm_token_tx(&header, nonce).await
+        })
+        .await
+    }
+
+    /// Submit `recvAbortToken(msgHeader)` — receiver-side compensation for a
+    /// rejected token receive.
+    pub(crate) async fn submit_recv_abort_token(
+        &self,
+        header: &CrossRollupDependency,
+    ) -> Result<(), CoordinatorError> {
+        let header = header.clone();
+        self.submit_l2_bridge_tx(move |builder, nonce| async move {
+            builder.build_recv_abort_token_tx(&header, nonce).await
+        })
+        .await
+    }
+
+    /// Submit `recvConfirmETH(msgHeader)` — receiver-side finalize for an ETH
+    /// receive.
+    pub(crate) async fn submit_recv_confirm_eth(
+        &self,
+        header: &CrossRollupDependency,
+    ) -> Result<(), CoordinatorError> {
+        let header = header.clone();
+        self.submit_l2_bridge_tx(move |builder, nonce| async move {
+            builder.build_recv_confirm_eth_tx(&header, nonce).await
+        })
+        .await
+    }
+
+    /// Submit `recvAbortETH(msgHeader)` — receiver-side compensation for a
+    /// rejected ETH receive.
+    pub(crate) async fn submit_recv_abort_eth(
+        &self,
+        header: &CrossRollupDependency,
+    ) -> Result<(), CoordinatorError> {
+        let header = header.clone();
+        self.submit_l2_bridge_tx(move |builder, nonce| async move {
+            builder.build_recv_abort_eth_tx(&header, nonce).await
+        })
+        .await
     }
 
     pub(crate) async fn resync_put_inbox_nonce(&self) -> Result<(), CoordinatorError> {
@@ -322,6 +646,14 @@ mod tests {
         }
 
         async fn build_put_inbox_tx_with_nonce(
+            &self,
+            _dep: &CrossRollupDependency,
+            nonce: u64,
+        ) -> Result<Vec<u8>, CoordinatorError> {
+            Ok(nonce.to_be_bytes().to_vec())
+        }
+
+        async fn build_remove_inbox_tx_with_nonce(
             &self,
             _dep: &CrossRollupDependency,
             nonce: u64,

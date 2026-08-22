@@ -21,4 +21,13 @@ pub trait PutInboxBuilder: Send + Sync + 'static {
         dep: &CrossRollupDependency,
         nonce: u64,
     ) -> Result<Vec<u8>, CoordinatorError>;
+
+    /// Build a signed `removeInbox` transaction with the provided nonce.
+    /// `dep.data` must be the exact payload originally passed to `putInbox`
+    /// for this key, or the contract reverts with `MessageNotFound`.
+    async fn build_remove_inbox_tx_with_nonce(
+        &self,
+        dep: &CrossRollupDependency,
+        nonce: u64,
+    ) -> Result<Vec<u8>, CoordinatorError>;
 }

@@ -6,6 +6,7 @@
 pub mod abi;
 pub mod contract;
 pub mod error;
+pub mod l2_bridge;
 pub mod matching;
 pub mod overrides;
 pub mod parser;

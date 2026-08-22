@@ -16,7 +16,8 @@ use tracing::{error, info, warn};
 
 use compose_metrics::SidecarMetrics;
 use compose_primitives_traits::{
-    CoordinatorError, MailboxSender, PublisherClient, PutInboxBuilder, XtBuilderClient,
+    CoordinatorError, L2BridgeTxBuilder, MailboxSender, PublisherClient, PutInboxBuilder,
+    XtBuilderClient,
 };
 use compose_proto::{wire_message::Payload, MailboxMessage};
 
@@ -39,11 +40,24 @@ pub struct VerificationConfig {
 }
 
 // Transaction chunks
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChunkStage {
+    #[default]
+    Registered,
+    WaitingForMessages,
+    WaitingForProcessing,
+    WaitingForDecided,
+    Confirmed,
+    Aborted
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TransactionChunk {
     pub instance_id: String,
-    pub stage: u64,
-    pub transactions: Vec<Vec<u8>>,
+    pub confirmed_stage: Option<ChunkStage>,
+    pub stage: ChunkStage,
+    pub organised_transactions: HashMap<String, Vec<u8>>,
+    pub is_sender: Option<bool>,
 }
 
 /// Shared coordinator state protected by a `RwLock`.
@@ -77,6 +91,8 @@ pub(crate) struct CoordinatorState {
     /// bytes and drained into `PendingXt::pending_mailbox` the moment the XT
     /// is registered.  Entries are cleared on rollback when the period resets.
     pub mailbox_buffer: HashMap<Vec<u8>, Vec<MailboxMessage>>,
+    pub inflight_chunks: HashMap<String, TransactionChunk>,
+    pub mailbox_messages: HashMap<String, Vec<MailboxMessage>>,
 }
 
 impl CoordinatorState {
@@ -95,6 +111,8 @@ impl CoordinatorState {
             pending_submissions: HashMap::new(),
             mailbox_index: HashMap::new(),
             mailbox_buffer: HashMap::new(),
+            inflight_chunks: HashMap::new(),
+            mailbox_messages: HashMap::new(),
         }
     }
 
@@ -131,12 +149,14 @@ pub struct DefaultCoordinator {
     pub(crate) mailbox_queue: Option<Arc<dyn MailboxQueue>>,
     pub(crate) peer_coordinator: Option<Arc<dyn PeerCoordinator>>,
     pub(crate) put_inbox_builder: Option<Arc<dyn PutInboxBuilder>>,
+    pub(crate) l2_bridge_builder: Option<Arc<dyn L2BridgeTxBuilder>>,
     pub(crate) xt_builder_client: Option<Arc<dyn XtBuilderClient>>,
     pub(crate) circ_timeout_ms: u64,
     pub(crate) task_tracker: TaskTracker,
     pub(crate) metrics: Option<Arc<SidecarMetrics>>,
     pub(crate) verification: VerificationConfig,
     pub(crate) verification_client: Option<Client>,
+    pub(crate) chunk_sender: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 impl std::fmt::Debug for DefaultCoordinator {
@@ -170,18 +190,29 @@ impl DefaultCoordinator {
             mailbox_queue,
             peer_coordinator,
             put_inbox_builder: None,
+            l2_bridge_builder: None,
             xt_builder_client: None,
             circ_timeout_ms,
             task_tracker: TaskTracker::new(),
             metrics: None,
             verification_client: Self::build_verification_client(&verification),
             verification,
+            chunk_sender: None,
         }
     }
 
     /// Attach a metrics instance to this coordinator.
     pub fn set_metrics(&mut self, metrics: Arc<SidecarMetrics>) {
         self.metrics = Some(metrics);
+    }
+
+    /// Attach the sender half of the main.rs chunk-processing signal channel.
+    /// Only an `instance_id` is ever sent through it — the chunk processor
+    /// always re-fetches the current `TransactionChunk` from `state` at
+    /// dispatch time via `get_inflight_chunk`, so there's a single source of
+    /// truth and no risk of dispatching on a stale snapshot.
+    pub fn set_chunk_sender(&mut self, sender: tokio::sync::mpsc::Sender<String>) {
+        self.chunk_sender = Some(sender);
     }
 
     /// Attach a putInbox signer used for local dependency fulfillment.
@@ -192,6 +223,26 @@ impl DefaultCoordinator {
     /// Attach a builder-control client for XT reservation lifecycle events.
     pub fn set_xt_builder_client(&mut self, client: Arc<dyn XtBuilderClient>) {
         self.xt_builder_client = Some(client);
+    }
+
+    /// Attach a signer for `ComposeL2ToL2Bridge` finalize/compensate
+    /// transactions (`sendConfirm`, `sendAbort*`, `recvConfirm*`, `recvAbort*`).
+    pub fn set_l2_bridge_builder(&mut self, builder: Arc<dyn L2BridgeTxBuilder>) {
+        self.l2_bridge_builder = Some(builder);
+    }
+
+    /// Current inflight chunk for `instance_id`, if any — a fresh clone, read
+    /// and released immediately. This is the single source of truth the
+    /// chunk processor dispatches on; callers must not hold a chunk fetched
+    /// this way across a call into `register_xt`/`process_xt`/`confirm_xt`/
+    /// `abort_xt`, which themselves lock `state` internally.
+    pub async fn get_inflight_chunk(&self, instance_id: &str) -> Option<TransactionChunk> {
+        self.state
+            .read()
+            .await
+            .inflight_chunks
+            .get(instance_id)
+            .cloned()
     }
 
     fn build_verification_client(verification: &VerificationConfig) -> Option<Client> {
@@ -546,7 +597,11 @@ impl DefaultCoordinator {
             let coordinator = self.clone();
             let id = instance_id.clone();
             self.task_tracker.spawn(async move {
-                coordinator.process_xt(&id).await;
+                let mut chunk = TransactionChunk {
+                    instance_id: id.to_string(),
+                    ..Default::default()
+                };
+                coordinator.register_xt(&mut chunk).await;
             });
         }
 

@@ -23,6 +23,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/xt/forward", post(handlers::peer::handle_forward_xt))
         .route("/xt/vote", post(handlers::peer::handle_peer_vote))
         .route("/mailbox", post(handlers::peer::handle_mailbox))
+        .route("/mailbox/ack", post(handlers::ack::handle_ack))
         // Health and observability endpoints
         .route("/health", get(handlers::health::handle_health))
         .route("/ready", get(handlers::health::handle_ready))

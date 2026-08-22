@@ -32,6 +32,13 @@ struct AbortXtRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct SubmitBundleRequest {
+    instance_id: String,
+    order: XtOrderKey,
+    transactions: Vec<Bytes>,
+}
+
+#[derive(Debug, Serialize)]
 struct XtOrderKey {
     period_id: u64,
     sequence_number: u64,
@@ -132,6 +139,29 @@ impl XtBuilderClient for HttpXtBuilderClient {
         };
 
         self.call("ethera_submitXt", request).await
+    }
+
+    async fn submit_tx(&self, tx: &[u8]) -> Result<(), CoordinatorError> {
+        self.call("eth_sendRawTransaction", Bytes::copy_from_slice(tx)).await
+    }
+
+    async fn submit_ordered_bundle(
+        &self,
+        instance_id: &str,
+        period_id: u64,
+        sequence_number: u64,
+        transactions: Vec<Vec<u8>>,
+    ) -> Result<(), CoordinatorError> {
+        let request = SubmitBundleRequest {
+            instance_id: instance_id.to_string(),
+            order: XtOrderKey {
+                period_id,
+                sequence_number,
+            },
+            transactions: transactions.into_iter().map(Bytes::from).collect(),
+        };
+
+        self.call("ethera_submitOrderedBundle", request).await
     }
 
     async fn release_xt(

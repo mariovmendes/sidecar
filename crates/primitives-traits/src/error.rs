@@ -7,6 +7,15 @@ pub enum CoordinatorError {
     #[error("coordinator already running")]
     AlreadyRunning,
 
+    #[error("chunk sender not set")]
+    ChunkSenderNotSet(String),
+
+    #[error("enqueue to chunk sender error")]
+    QueueError(String),
+
+    #[error("function called at wrong stage of chunk")]
+    WrongChunkStage(String),
+
     #[error("coordinator not running")]
     NotRunning,
 

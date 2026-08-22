@@ -9,6 +9,8 @@ use compose_config::{MockProofArgs, SidecarArgs};
 use compose_coordinator::builder::CoordinatorBuilder;
 use compose_coordinator::builder_client::HttpXtBuilderClient;
 use compose_coordinator::coordinator::{DefaultCoordinator, TransactionChunk, VerificationConfig};
+use compose_coordinator::coordinator::ChunkStage::*;
+use compose_mailbox::l2_bridge::L2BridgeContractTxBuilder;
 use compose_mailbox::put_inbox::PutInboxTxBuilder;
 use compose_mailbox::queue::InMemoryQueue;
 use compose_metrics::SidecarMetrics;
@@ -28,6 +30,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
+use compose_coordinator::coordinator::ChunkStage::{Aborted, Registered};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,17 +43,18 @@ async fn main() -> Result<()> {
     let mut registry = Registry::default();
     let metrics = Arc::new(SidecarMetrics::new(&mut registry));
 
-    let (coordinator, quic_client) = build_coordinator(&args, metrics)?;
+    let (mut coordinator, quic_client) = build_coordinator(&args, metrics)?;
 
     coordinator.start().await?;
 
-    let coordinator_arc = Arc::new(coordinator);
+    let (tx, rx) = mpsc::channel::<String>(300);
+    coordinator.set_chunk_sender(tx.clone());
 
-    let (tx, rx) = mpsc::channel::<TransactionChunk>(300);
+    let coordinator_arc = Arc::new(coordinator);
 
     if let Some(client) = quic_client {
         spawn_publisher_connection(coordinator_arc.clone(), client, tx.clone());
-        spawn_chunk_processor(coordinator_arc.clone(), tx, rx);
+        spawn_chunk_processor(coordinator_arc.clone(), rx);
     }
 
     if args.mock_proof.enabled {
@@ -116,6 +120,31 @@ fn build_coordinator(
             has_mailbox,
             has_coordinator_key = has_key,
             "putInbox builder disabled due to incomplete chain config"
+        );
+    }
+
+    let l2_bridge_address = &args.chain.l2_bridge_address;
+    let has_l2_bridge = !l2_bridge_address.is_empty();
+    if has_rpc && has_l2_bridge && has_key {
+        match L2BridgeContractTxBuilder::new(
+            chain_id.0,
+            chain_rpc.to_string(),
+            l2_bridge_address.clone(),
+            args.chain.coordinator_key.clone(),
+        ) {
+            Ok(l2_bridge) => {
+                builder = builder.l2_bridge_builder(Arc::new(l2_bridge));
+            }
+            Err(e) => {
+                warn!(error = %e, endpoint = chain_rpc, "Failed to configure l2 bridge builder");
+            }
+        }
+    } else if has_l2_bridge || has_key {
+        warn!(
+            has_rpc,
+            has_l2_bridge,
+            has_coordinator_key = has_key,
+            "l2 bridge builder disabled due to incomplete chain config"
         );
     }
 
@@ -191,7 +220,7 @@ fn build_coordinator(
     Ok((builder.build()?, quic_client))
 }
 
-fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<QuicClient>, tx: Sender<TransactionChunk>) {
+fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<QuicClient>, tx: Sender<String>) {
     tokio::spawn(async move {
         info!("Connecting to publisher");
         if let Err(e) = client.connect_with_retry().await {
@@ -220,12 +249,48 @@ fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<
     });
 }
 
-fn spawn_chunk_processor(coordinator: Arc<DefaultCoordinator>, client: Sender<TransactionChunk>, mut rx: Receiver<TransactionChunk>){
+fn spawn_chunk_processor(coordinator: Arc<DefaultCoordinator>, mut rx: Receiver<String>){
     tokio::spawn(async move {
         info!("Starting chunk processor");
-        while let Some(cmd) = rx.recv().await {
-            warn!("{:?}", cmd);
-            coordinator.process_xt(&cmd.instance_id).await;
+        while let Some(instance_id) = rx.recv().await {
+            // Always dispatch on a fresh fetch of the chunk's current state
+            // rather than any snapshot carried by the signal itself — the
+            // signal only ever means "something changed for this instance,
+            // go look." This is what makes register_xt only reachable via
+            // the `None` arm: once an instance exists in `inflight_chunks`
+            // (even at `Aborted`), a late/duplicate `Registered` signal for
+            // it lands in the `Some` arm instead and is re-dispatched on its
+            // real current stage, so it can never be mistaken for a fresh
+            // registration.
+            match coordinator.get_inflight_chunk(&instance_id).await {
+                Some(mut chunk) => {
+                    if chunk.confirmed_stage == Some(chunk.stage) {
+                        // Already fully processed for this stage; a
+                        // duplicate/late signal, nothing new to do.
+                        continue;
+                    }
+                    match chunk.stage {
+                        WaitingForProcessing => {
+                            coordinator.process_xt(&mut chunk).await;
+                        }
+                        Confirmed => {
+                            coordinator.confirm_xt(&mut chunk).await;
+                        }
+                        Aborted => {
+                            coordinator.abort_xt(&mut chunk).await;
+                        }
+                        _ => {}
+                    }
+                }
+                None => {
+                    let mut chunk = TransactionChunk {
+                        instance_id: instance_id.clone(),
+                        stage: Registered,
+                        ..Default::default()
+                    };
+                    coordinator.register_xt(&mut chunk).await;
+                }
+            }
         }
     });
 }

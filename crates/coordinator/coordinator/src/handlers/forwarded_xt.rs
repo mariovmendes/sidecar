@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use compose_primitives::{ChainId, SequenceNumber};
 use tracing::{debug, info};
 
-use crate::coordinator::DefaultCoordinator;
+use crate::coordinator::{DefaultCoordinator, TransactionChunk};
 use crate::model::pending_xt::PendingXt;
 use crate::pipeline::delivery::build_sender_nonce_cache;
 use compose_primitives_traits::CoordinatorError;
@@ -96,7 +96,7 @@ impl DefaultCoordinator {
             .get(instance_id)
             .and_then(|xt| self.local_builder_submission(xt));
 
-        // Release the write lock before spawning so process_xt can acquire it.
+        // Release the write lock before spawning so register_xt can acquire it.
         drop(state);
 
         if let Some(submission) = local_submission {
@@ -110,7 +110,11 @@ impl DefaultCoordinator {
             let coordinator = self.clone();
             let id = instance_id.to_string();
             self.task_tracker.spawn(async move {
-                coordinator.process_xt(&id).await;
+                let mut chunk = TransactionChunk {
+                    instance_id: id,
+                    ..Default::default()
+                };
+                coordinator.register_xt(&mut chunk).await;
             });
         }
 
