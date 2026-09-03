@@ -19,14 +19,11 @@ pub trait XtBuilderClient: Send + Sync + 'static {
     /// Submits transaction to be included without any prior reservation needed.
     async fn submit_tx(&self, tx: &[u8]) -> Result<(), CoordinatorError>;
 
-    /// Submits an ordered list of transactions to be executed atomically, in
-    /// the given order, in a single flashblock, without any prior reservation.
-    async fn submit_ordered_bundle(
+    /// Followup on an instance by submitting the putInbox transaction.
+    async fn submit_followup_xt(
         &self,
         instance_id: &str,
-        period_id: u64,
-        sequence_number: u64,
-        transactions: Vec<Vec<u8>>,
+        put_inbox_transactions: Vec<Vec<u8>>,
     ) -> Result<(), CoordinatorError>;
 
     /// Release a previously reserved XT so the builder may execute it.

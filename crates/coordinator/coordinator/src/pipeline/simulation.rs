@@ -1,30 +1,31 @@
 //! Simulation pipeline and vote emission flow.
 
-use std::time::{Duration, Instant as StdInstant};
+use crate::coordinator::ChunkStage::{
+    Aborted, Confirmed, Registered, WaitingForDecided, WaitingForMessages,
+};
+use crate::coordinator::{ChunkStage, DefaultCoordinator, TransactionChunk};
+use crate::model::chain_overlay::ChainOverlay;
+use crate::pipeline::delivery::decode_sender_nonce;
 use alloy::consensus::{Transaction, TxEnvelope};
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::{SolCall, SolValue};
+use compose_mailbox::contract::{
+    approveCall, bridgeCETToCall, bridgeERC20ToCall, bridgeEthToCall, receiveETHCall,
+    receiveTokensCall,
+};
 use compose_mailbox::matching::{
-    contains_message, dependency_keys_equal, matches_dependency, DependencyKey, MailboxMessageKey,
+    contains_message, matches_dependency, DependencyKey, MailboxMessageKey,
 };
 use compose_mailbox::overrides::merge_overrides;
 use compose_mailbox::wire;
 use compose_primitives::{ChainId, CrossRollupDependency, CrossRollupMessage, StateOverride};
+use compose_primitives_traits::{SendAbortEthParams, SendAbortTokenParams};
 use compose_proto::MailboxMessage;
+use compose_simulation::error::SimulationError;
 use serde::Serialize;
-use tokio::sync::mpsc::Sender;
+use std::time::{Duration, Instant as StdInstant};
 use tokio::time::{sleep_until, Instant};
 use tracing::{debug, error, info, warn};
-use compose_mailbox::contract::{
-    approveCall, bridgeCETToCall, bridgeERC20ToCall, bridgeEthToCall, putInboxCall,
-    readMessageCall, receiveETHCall, receiveTokensCall, removeInboxCall, writeMessageCall,
-};
-use compose_simulation::error::SimulationError;
-use crate::coordinator::{ChunkStage, DefaultCoordinator, TransactionChunk};
-use crate::coordinator::ChunkStage::{Aborted, Confirmed, Registered, WaitingForProcessing, WaitingForDecided, WaitingForMessages};
-use crate::model::chain_overlay::ChainOverlay;
-use crate::pipeline::delivery::decode_sender_nonce;
-use compose_primitives_traits::{SendAbortEthParams, SendAbortTokenParams};
 
 #[derive(Debug, Serialize)]
 struct VerificationPayload<'a> {
@@ -114,9 +115,14 @@ impl DefaultCoordinator {
                         txs.clone()
                     }
                     _ => {
-                        warn!(transaction_chunk.instance_id, "No local transactions, rejecting");
+                        warn!(
+                            transaction_chunk.instance_id,
+                            "No local transactions, rejecting"
+                        );
                         drop(state);
-                        let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
+                        let _ = self
+                            .send_vote(transaction_chunk.instance_id.as_str(), false)
+                            .await;
                         return;
                     }
                 },
@@ -137,24 +143,27 @@ impl DefaultCoordinator {
             return;
         }*/
 
-
         let simulator = match &self.simulator {
             Some(s) => s.clone(),
             None => {
                 warn!("No simulator configured, voting yes without simulation");
-                let _ = self.send_vote(transaction_chunk.instance_id.as_str(), true).await;
+                let _ = self
+                    .send_vote(transaction_chunk.instance_id.as_str(), true)
+                    .await;
                 return;
             }
         };
         let mut needs_approve = false;
-
         let mut include_transactions = false;
 
         // Re-validate under the write lock: the XT may have been rolled back
         // between the read lock above and here.
         let received_message_xt = {
             let state = self.state.write().await;
-            if !state.pending.contains_key(transaction_chunk.instance_id.as_str()) {
+            if !state
+                .pending
+                .contains_key(transaction_chunk.instance_id.as_str())
+            {
                 warn!(
                     transaction_chunk.instance_id,
                     "XT disappeared during simulation (likely rollback)"
@@ -163,9 +172,10 @@ impl DefaultCoordinator {
                 return;
             }
 
-           state.mailbox_messages.contains_key(&transaction_chunk.instance_id)
+            state
+                .mailbox_messages
+                .contains_key(&transaction_chunk.instance_id)
         };
-
 
         // Process each transaction.
         for tx_bytes in tx_bytes_list.iter() {
@@ -173,7 +183,9 @@ impl DefaultCoordinator {
                 Ok(input) => input,
                 Err(e) => {
                     warn!(transaction_chunk.instance_id, error = %e, "Failed to decode transaction, voting false");
-                    let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
+                    let _ = self
+                        .send_vote(transaction_chunk.instance_id.as_str(), false)
+                        .await;
                     return;
                 }
             };
@@ -187,23 +199,33 @@ impl DefaultCoordinator {
                         needs_approve = true;
                     }
                     include_transactions = true;
-                    transaction_chunk.organised_transactions.insert(String::from("bridge"),tx_bytes.clone());
+                    transaction_chunk
+                        .organised_transactions
+                        .insert(String::from("bridge"), tx_bytes.clone());
                     transaction_chunk.is_sender = Some(true);
                 } else if selector == approveCall::SELECTOR {
-                    transaction_chunk.organised_transactions.insert(String::from("approve"),tx_bytes.clone());
+                    transaction_chunk
+                        .organised_transactions
+                        .insert(String::from("approve"), tx_bytes.clone());
                 } else if selector == receiveTokensCall::SELECTOR
                     || selector == receiveETHCall::SELECTOR
                 {
                     transaction_chunk.is_sender = Some(false);
-                    transaction_chunk.organised_transactions.insert(String::from("receive"),tx_bytes.clone());
+                    transaction_chunk
+                        .organised_transactions
+                        .insert(String::from("receive"), tx_bytes.clone());
                 } else {
                     warn!("Unrecognised transaction type, voting false");
-                    let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
+                    let _ = self
+                        .send_vote(transaction_chunk.instance_id.as_str(), false)
+                        .await;
                     return;
                 }
             } else {
                 warn!("Unrecognised transaction, voting false");
-                let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
+                let _ = self
+                    .send_vote(transaction_chunk.instance_id.as_str(), false)
+                    .await;
                 return;
             }
         }
@@ -212,14 +234,17 @@ impl DefaultCoordinator {
         transaction_chunk.stage = WaitingForMessages;
         {
             let mut state = self.state.write().await;
-            state.inflight_chunks.insert(transaction_chunk.instance_id.clone(), transaction_chunk.clone());
+            state.inflight_chunks.insert(
+                transaction_chunk.instance_id.clone(),
+                transaction_chunk.clone(),
+            );
         }
 
         // A Decided(false) may have raced ahead of register_xt and already
         // been recorded on `xt.decision` by on_decision, before any chunk
         // existed for it to advance. Nothing has been submitted to the
         // builder yet at this point (that happens below), so there's
-        // nothing to compensate — just mark this instance done instead of
+        // nothing to compensate. We just need to mark this instance done instead of
         // falling through and submitting approve/bridge for an XT that's
         // already known to be aborted.
         let already_decided = {
@@ -230,11 +255,17 @@ impl DefaultCoordinator {
                 .and_then(|xt| xt.decision)
         };
         if already_decided == Some(false) {
-            info!(transaction_chunk.instance_id, "Decision already recorded as abort before submission, skipping");
+            info!(
+                transaction_chunk.instance_id,
+                "Decision already recorded as abort before submission, skipping"
+            );
             transaction_chunk.stage = Aborted;
             transaction_chunk.confirmed_stage = Some(Aborted);
             let mut state = self.state.write().await;
-            state.inflight_chunks.insert(transaction_chunk.instance_id.clone(), transaction_chunk.clone());
+            state.inflight_chunks.insert(
+                transaction_chunk.instance_id.clone(),
+                transaction_chunk.clone(),
+            );
             return;
         }
 
@@ -245,41 +276,72 @@ impl DefaultCoordinator {
 
         if include_transactions {
             if let Some(builder) = &self.xt_builder_client {
-                let approve_tx_bytes = transaction_chunk.organised_transactions.get("approve").cloned();
+                let approve_tx_bytes = transaction_chunk
+                    .organised_transactions
+                    .get("approve")
+                    .cloned();
+                let mut txs_to_submit: Vec<Vec<u8>> = Vec::new();
                 if needs_approve {
                     if let Some(approve_tx_bytes) = &approve_tx_bytes {
-                        let res = builder.submit_tx(approve_tx_bytes).await;
-                        if let Err(e) = res {
-                            warn!("Failed to submit tx, approve not present: {e}");
-                            let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
-                            {
-                                let mut state = self.state.write().await;
-                                state.inflight_chunks.remove(transaction_chunk.instance_id.as_str());
-                            }
-                            return;
-                        }
+                        txs_to_submit.push(approve_tx_bytes.clone());
                     }
                 }
 
-                let bridge_tx_bytes = transaction_chunk.organised_transactions.get("bridge").cloned();
-                if let Some(bridge_tx_bytes) = &bridge_tx_bytes {
-                    let res = builder.submit_tx(bridge_tx_bytes).await;
-                    if let Err(e) = res {
-                        warn!("Failed to submit tx: {e}");
-                        let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
-                        {
-                            let mut state = self.state.write().await;
-                            state.inflight_chunks.remove(transaction_chunk.instance_id.as_str());
-                        }
-                        return;
-                    }
+                let (period_id, sequence_number) = {
+                    let state = self.state.read().await;
+                    state
+                        .pending
+                        .get(transaction_chunk.instance_id.as_str())
+                        .map(|xt| {
+                            let seq = if xt.sequence_num.0 != 0 {
+                                xt.sequence_num.0
+                            } else {
+                                xt.origin_seq.0
+                            };
+                            (xt.period_id.0, seq)
+                        })
+                        .unwrap_or((0, 0))
+                };
 
-                    self.notify_outbound_dependency(
-                        &simulator,
-                        transaction_chunk.instance_id.as_str(),
-                        approve_tx_bytes.as_deref(),
-                        &bridge_tx_bytes,
-                    ).await;
+                let bridge_tx_bytes = transaction_chunk
+                    .organised_transactions
+                    .get("bridge")
+                    .cloned();
+                if let Some(bridge_tx_bytes) = &bridge_tx_bytes {
+                    txs_to_submit.push(bridge_tx_bytes.clone());
+                    match builder
+                        .submit_locked_xt(
+                            transaction_chunk.instance_id.as_str(),
+                            period_id,
+                            sequence_number,
+                            txs_to_submit,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            self.notify_outbound_dependency(
+                                &simulator,
+                                transaction_chunk.instance_id.as_str(),
+                                approve_tx_bytes.as_deref(),
+                                &bridge_tx_bytes,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            warn!(
+                                transaction_chunk.instance_id,
+                                error = %e,
+                                "Failed to submit locked XT to builder, voting false"
+                            );
+                            let _ = self
+                                .send_vote(transaction_chunk.instance_id.as_str(), false)
+                                .await;
+                            let mut state = self.state.write().await;
+                            state
+                                .inflight_chunks
+                                .remove(transaction_chunk.instance_id.as_str());
+                        }
+                    }
                 }
             }
         }
@@ -322,7 +384,10 @@ impl DefaultCoordinator {
             }
         }
 
-        let bridge_result = match simulator.simulate(self.chain_id, bridge_tx_bytes, &overrides).await {
+        let bridge_result = match simulator
+            .simulate(self.chain_id, bridge_tx_bytes, &overrides)
+            .await
+        {
             Ok(result) if result.success => result,
             Ok(result) => {
                 warn!(instance_id, error = ?result.error, "Bridge simulation failed, skipping outbound ack");
@@ -462,16 +527,22 @@ impl DefaultCoordinator {
     fn decode_receive_header(tx_bytes: &[u8]) -> Result<CrossRollupDependency, SimulationError> {
         let input = Self::get_input(tx_bytes)?;
         if input.len() < 4 {
-            return Err(SimulationError::Other("receive tx input too short".to_string()));
+            return Err(SimulationError::Other(
+                "receive tx input too short".to_string(),
+            ));
         }
 
         let header = if input[..4] == receiveTokensCall::SELECTOR {
             receiveTokensCall::abi_decode(&input)
-                .map_err(|e| SimulationError::Other(format!("failed to decode receiveTokens call: {e}")))?
+                .map_err(|e| {
+                    SimulationError::Other(format!("failed to decode receiveTokens call: {e}"))
+                })?
                 .msgHeader
         } else if input[..4] == receiveETHCall::SELECTOR {
             receiveETHCall::abi_decode(&input)
-                .map_err(|e| SimulationError::Other(format!("failed to decode receiveETH call: {e}")))?
+                .map_err(|e| {
+                    SimulationError::Other(format!("failed to decode receiveETH call: {e}"))
+                })?
                 .msgHeader
         } else {
             return Err(SimulationError::Other(
@@ -497,162 +568,212 @@ impl DefaultCoordinator {
 
     pub async fn process_xt(&self, transaction_chunk: &mut TransactionChunk) {
         if let Some(builder) = &self.xt_builder_client {
-            {
-                if let Some(val) = transaction_chunk.is_sender {
-                    if val {
-                        // Either a locally-decoded writeMessage tx (legacy path,
-                        // currently unused) or an ACK CrossRollupDependency
-                        // recorded via handle_ack_dependency (POST /mailbox/ack).
-                        let ack_send_bytes =
-                            transaction_chunk.organised_transactions.get("ackSend").cloned();
+            if let Some(val) = transaction_chunk.is_sender {
+                if val {
+                    // Either a locally-decoded writeMessage tx (legacy path,
+                    // currently unused) or an ACK CrossRollupDependency
+                    // recorded via handle_ack_dependency (POST /mailbox/ack).
+                    let ack_send_bytes = transaction_chunk
+                        .organised_transactions
+                        .get("ackSend")
+                        .cloned();
 
-                        let put_inbox_result = if let Some(ack_send_bytes) = ack_send_bytes {
-                            Some(self.submit_put_inbox_for_tx(&ack_send_bytes).await)
-                        } else {
-                            let ack_dependency = self
-                                .lookup_mailbox_dependency(transaction_chunk.instance_id.as_str(), "ACK")
-                                .await;
-
-                            match ack_dependency {
-                                Some(dep) => Some(self.handle_dependency(dep).await),
-                                None => {
-                                    warn!("No ackSend tx or mailbox ACK found for instance, rejecting");
-                                    let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
-                                    return;
-                                }
-                            }
-                        };
-
-                        if let Some(Err(e)) = put_inbox_result {
-                            warn!("Failed to submit putInbox tx: {e}");
-                            let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
-                            return;
-                        }
-
-                        let _ = self.send_vote(transaction_chunk.instance_id.as_str(), true).await;
-                        transaction_chunk.confirmed_stage = Some(WaitingForMessages);
-                        transaction_chunk.stage = WaitingForDecided;
-                        self.state.write().await.inflight_chunks.insert(transaction_chunk.instance_id.clone(), transaction_chunk.clone());
-                        self.dispatch_if_already_decided(transaction_chunk).await;
-                        return;
-                    } else {
-                        if transaction_chunk.organised_transactions.is_empty() {
-                            warn!("No transactions to process, rejecting");
-                            let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
-                            return;
-                        }
-
-                        let Some(receive_tx_bytes) =
-                            transaction_chunk.organised_transactions.get("receive").cloned()
-                        else {
-                            warn!("Transaction of chunk not recognised, rejecting");
-                            let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
-                            return;
-                        };
-
-                        let expected_dependency = match Self::decode_receive_header(&receive_tx_bytes) {
-                            Ok(dep) => dep,
-                            Err(e) => {
-                                warn!("Failed to decode receive tx header: {e}");
-                                let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
-                                return;
-                            }
-                        };
-
-                        let mailbox_msg = {
-                            let state = self.state.read().await;
-                            state
-                                .mailbox_messages
-                                .get(transaction_chunk.instance_id.as_str())
-                                .and_then(|msgs| {
-                                    msgs.iter().find(|msg| matches_dependency(msg, &expected_dependency))
-                                })
-                                .cloned()
-                        };
-
-                        let Some(mailbox_msg) = mailbox_msg else {
-                            warn!("No matching mailbox message recorded for instance, rejecting");
-                            let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
-                            return;
-                        };
-
-                        let dependency = CrossRollupDependency {
-                            data: Some(mailbox_msg.payload.clone()),
-                            ..expected_dependency
-                        };
-
-                        // putInbox must execute before the receive tx: readMessage()
-                        // reverts unless putInbox already ran in this block. Submitting
-                        // them separately via submit_tx only orders their arrival at the
-                        // pool, not their execution order, so we bundle them into a single
-                        // atomically-ordered submission instead.
-                        let put_inbox_tx = match self.build_put_inbox_transaction(&dependency).await {
-                            Ok(tx) => tx,
-                            Err(e) => {
-                                if let Err(resync_err) = self.resync_put_inbox_nonce().await {
-                                    warn!(error = %resync_err, "Failed to resync putInbox nonce after build error");
-                                }
-                                warn!("Failed to build putInbox tx: {e}");
-                                let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
-                                return;
-                            }
-                        };
-
-                        let (period_id, sequence_number) = {
-                            let state = self.state.read().await;
-                            state
-                                .pending
-                                .get(transaction_chunk.instance_id.as_str())
-                                .map(|xt| {
-                                    let seq = if xt.sequence_num.0 != 0 {
-                                        xt.sequence_num.0
-                                    } else {
-                                        xt.origin_seq.0
-                                    };
-                                    (xt.period_id.0, seq)
-                                })
-                                .unwrap_or((0, 0))
-                        };
-
-                        if let Err(e) = builder
-                            .submit_ordered_bundle(
+                    let put_inbox_result = if let Some(ack_send_bytes) = ack_send_bytes {
+                        Some(
+                            self.submit_put_inbox_for_tx(
                                 transaction_chunk.instance_id.as_str(),
-                                period_id,
-                                sequence_number,
-                                vec![put_inbox_tx, receive_tx_bytes.clone()],
+                                &ack_send_bytes,
                             )
-                            .await
-                        {
-                            if let Err(resync_err) = self.resync_put_inbox_nonce().await {
-                                warn!(error = %resync_err, "Failed to resync putInbox nonce after submit error");
-                            }
-                            warn!("Failed to submit putInbox+receive bundle: {e}");
-                            let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
-                            return;
-                        }
-                        self.notify_receive_ack(
-                            transaction_chunk.instance_id.as_str(),
-                            &dependency,
-                            &receive_tx_bytes,
+                            .await,
                         )
-                        .await;
+                    } else {
+                        let ack_dependency = self
+                            .lookup_mailbox_dependency(
+                                transaction_chunk.instance_id.as_str(),
+                                "ACK",
+                            )
+                            .await;
 
-                        let _ = self.send_vote(transaction_chunk.instance_id.as_str(), true).await;
-                        transaction_chunk.confirmed_stage = Some(WaitingForMessages);
-                        transaction_chunk.stage = WaitingForDecided;
-                        self.state.write().await.inflight_chunks.insert(transaction_chunk.instance_id.clone(), transaction_chunk.clone());
-                        self.dispatch_if_already_decided(transaction_chunk).await;
+                        match ack_dependency {
+                            Some(dep) => Some(
+                                self.handle_dependency(transaction_chunk.instance_id.as_str(), dep)
+                                    .await,
+                            ),
+                            None => {
+                                warn!("No ackSend tx or mailbox ACK found for instance, rejecting");
+                                let _ = self
+                                    .send_vote(transaction_chunk.instance_id.as_str(), false)
+                                    .await;
+                                return;
+                            }
+                        }
+                    };
+
+                    if let Some(Err(e)) = put_inbox_result {
+                        warn!("Failed to submit putInbox tx: {e}");
+                        let _ = self
+                            .send_vote(transaction_chunk.instance_id.as_str(), false)
+                            .await;
                         return;
                     }
+
+                    let _ = self
+                        .send_vote(transaction_chunk.instance_id.as_str(), true)
+                        .await;
+                    transaction_chunk.confirmed_stage = Some(WaitingForMessages);
+                    transaction_chunk.stage = WaitingForDecided;
+                    self.state.write().await.inflight_chunks.insert(
+                        transaction_chunk.instance_id.clone(),
+                        transaction_chunk.clone(),
+                    );
+                    self.dispatch_if_already_decided(transaction_chunk).await;
+                    return;
                 } else {
-                    warn!("Transaction chunk not registered properly, rejecting");
-                    let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
+                    if transaction_chunk.organised_transactions.is_empty() {
+                        warn!("No transactions to process, rejecting");
+                        let _ = self
+                            .send_vote(transaction_chunk.instance_id.as_str(), false)
+                            .await;
+                        return;
+                    }
+
+                    let Some(receive_tx_bytes) = transaction_chunk
+                        .organised_transactions
+                        .get("receive")
+                        .cloned()
+                    else {
+                        warn!("Transaction of chunk not recognised, rejecting");
+                        let _ = self
+                            .send_vote(transaction_chunk.instance_id.as_str(), false)
+                            .await;
+                        return;
+                    };
+
+                    let expected_dependency = match Self::decode_receive_header(&receive_tx_bytes) {
+                        Ok(dep) => dep,
+                        Err(e) => {
+                            warn!("Failed to decode receive tx header: {e}");
+                            let _ = self
+                                .send_vote(transaction_chunk.instance_id.as_str(), false)
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let mailbox_msg = {
+                        let state = self.state.read().await;
+                        state
+                            .mailbox_messages
+                            .get(transaction_chunk.instance_id.as_str())
+                            .and_then(|msgs| {
+                                msgs.iter()
+                                    .find(|msg| matches_dependency(msg, &expected_dependency))
+                            })
+                            .cloned()
+                    };
+
+                    let Some(mailbox_msg) = mailbox_msg else {
+                        warn!("No matching mailbox message recorded for instance, rejecting");
+                        let _ = self
+                            .send_vote(transaction_chunk.instance_id.as_str(), false)
+                            .await;
+                        return;
+                    };
+
+                    let dependency = CrossRollupDependency {
+                        data: Some(mailbox_msg.payload.clone()),
+                        ..expected_dependency
+                    };
+
+                    let mut txs_to_submit: Vec<Vec<u8>> = Vec::new();
+
+                    // putInbox must execute before the receive tx: readMessage()
+                    // reverts unless putInbox already ran in this block. Submitting
+                    // them separately via submit_tx only orders their arrival at the
+                    // pool, not their execution order, so we bundle them into a single
+                    // atomically-ordered submission instead.
+                    let put_inbox_tx = match self.build_put_inbox_transaction(&dependency).await {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                                warn!(error = %resync_err, "Failed to resync putInbox nonce after build error");
+                            }
+                            warn!("Failed to build putInbox tx: {e}");
+                            let _ = self
+                                .send_vote(transaction_chunk.instance_id.as_str(), false)
+                                .await;
+                            return;
+                        }
+                    };
+
+                    txs_to_submit.push(put_inbox_tx.clone());
+                    txs_to_submit.push(receive_tx_bytes.clone());
+
+                    let (period_id, sequence_number) = {
+                        let state = self.state.read().await;
+                        state
+                            .pending
+                            .get(transaction_chunk.instance_id.as_str())
+                            .map(|xt| {
+                                let seq = if xt.sequence_num.0 != 0 {
+                                    xt.sequence_num.0
+                                } else {
+                                    xt.origin_seq.0
+                                };
+                                (xt.period_id.0, seq)
+                            })
+                            .unwrap_or((0, 0))
+                    };
+
+                    if let Err(e) = builder
+                        .submit_locked_xt(
+                            transaction_chunk.instance_id.as_str(),
+                            period_id,
+                            sequence_number,
+                            txs_to_submit,
+                        )
+                        .await
+                    {
+                        if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                            warn!(error = %resync_err, "Failed to resync putInbox nonce after submit error");
+                        }
+                        warn!("Failed to submit putInbox+receive bundle: {e}");
+                        let _ = self
+                            .send_vote(transaction_chunk.instance_id.as_str(), false)
+                            .await;
+                        return;
+                    }
+                    self.notify_receive_ack(
+                        transaction_chunk.instance_id.as_str(),
+                        &dependency,
+                        &receive_tx_bytes,
+                    )
+                    .await;
+
+                    let _ = self
+                        .send_vote(transaction_chunk.instance_id.as_str(), true)
+                        .await;
+                    transaction_chunk.confirmed_stage = Some(WaitingForMessages);
+                    transaction_chunk.stage = WaitingForDecided;
+                    self.state.write().await.inflight_chunks.insert(
+                        transaction_chunk.instance_id.clone(),
+                        transaction_chunk.clone(),
+                    );
+                    self.dispatch_if_already_decided(transaction_chunk).await;
                     return;
                 }
+            } else {
+                warn!("Transaction chunk not registered properly, rejecting");
+                let _ = self
+                    .send_vote(transaction_chunk.instance_id.as_str(), false)
+                    .await;
+                return;
             }
         } else {
             warn!("No transaction builder configured, rejecting");
-            let _ = self.send_vote(transaction_chunk.instance_id.as_str(), false).await;
+            let _ = self
+                .send_vote(transaction_chunk.instance_id.as_str(), false)
+                .await;
         }
     }
 
@@ -680,7 +801,10 @@ impl DefaultCoordinator {
         transaction_chunk.stage = if decision { Confirmed } else { Aborted };
         {
             let mut state = self.state.write().await;
-            state.inflight_chunks.insert(transaction_chunk.instance_id.clone(), transaction_chunk.clone());
+            state.inflight_chunks.insert(
+                transaction_chunk.instance_id.clone(),
+                transaction_chunk.clone(),
+            );
         }
 
         if decision {
@@ -695,8 +819,12 @@ impl DefaultCoordinator {
     pub async fn confirm_xt(&self, transaction_chunk: &mut TransactionChunk) {
         match transaction_chunk.is_sender {
             Some(true) => {
-                let Some(bridge_tx_bytes) = transaction_chunk.organised_transactions.get("bridge") else {
-                    warn!(transaction_chunk.instance_id, "No bridge tx recorded for sender confirm, dropping");
+                let Some(bridge_tx_bytes) = transaction_chunk.organised_transactions.get("bridge")
+                else {
+                    warn!(
+                        transaction_chunk.instance_id,
+                        "No bridge tx recorded for sender confirm, dropping"
+                    );
                     return;
                 };
                 let args = match Self::decode_bridge_call_args(bridge_tx_bytes) {
@@ -707,7 +835,10 @@ impl DefaultCoordinator {
                     }
                 };
                 let Some(l2_builder) = &self.l2_bridge_builder else {
-                    warn!(transaction_chunk.instance_id, "No l2 bridge builder configured, dropping confirm");
+                    warn!(
+                        transaction_chunk.instance_id,
+                        "No l2 bridge builder configured, dropping confirm"
+                    );
                     return;
                 };
                 let header = CrossRollupDependency {
@@ -720,16 +851,25 @@ impl DefaultCoordinator {
                     session_id: args.session_id(),
                 };
 
-                if let Err(e) = self.submit_send_confirm(&header).await {
+                if let Err(e) = self
+                    .submit_send_confirm(transaction_chunk.instance_id.as_str(), &header)
+                    .await
+                {
                     warn!(transaction_chunk.instance_id, error = %e, "Failed to submit sendConfirm");
                     return;
                 }
 
-                self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Confirmed).await;
+                self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Confirmed)
+                    .await;
             }
             Some(false) => {
-                let Some(receive_tx_bytes) = transaction_chunk.organised_transactions.get("receive") else {
-                    warn!(transaction_chunk.instance_id, "No receive tx recorded for receiver confirm, dropping");
+                let Some(receive_tx_bytes) =
+                    transaction_chunk.organised_transactions.get("receive")
+                else {
+                    warn!(
+                        transaction_chunk.instance_id,
+                        "No receive tx recorded for receiver confirm, dropping"
+                    );
                     return;
                 };
                 let header = match Self::decode_receive_header(receive_tx_bytes) {
@@ -740,24 +880,36 @@ impl DefaultCoordinator {
                     }
                 };
 
+                let instance_id = transaction_chunk.instance_id.as_str();
                 let result = match Self::receive_call_kind(receive_tx_bytes) {
-                    Some(ReceiveCallKind::Tokens) => self.submit_recv_confirm_token(&header).await,
-                    Some(ReceiveCallKind::Eth) => self.submit_recv_confirm_eth(&header).await,
+                    Some(ReceiveCallKind::Tokens) => {
+                        self.submit_recv_confirm_token(instance_id, &header).await
+                    }
+                    Some(ReceiveCallKind::Eth) => {
+                        self.submit_recv_confirm_eth(instance_id, &header).await
+                    }
                     None => {
-                        warn!(transaction_chunk.instance_id, "Receive tx selector not recognised for confirm, dropping");
+                        warn!(
+                            transaction_chunk.instance_id,
+                            "Receive tx selector not recognised for confirm, dropping"
+                        );
                         return;
                     }
                 };
 
                 if let Err(e) = result {
                     warn!(transaction_chunk.instance_id, error = %e, "Failed to submit recvConfirm");
-                    return
+                    return;
                 }
 
-                self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Confirmed).await;
+                self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Confirmed)
+                    .await;
             }
             None => {
-                warn!(transaction_chunk.instance_id, "Chunk missing is_sender at confirm, dropping");
+                warn!(
+                    transaction_chunk.instance_id,
+                    "Chunk missing is_sender at confirm, dropping"
+                );
             }
         }
     }
@@ -767,24 +919,35 @@ impl DefaultCoordinator {
     pub async fn abort_xt(&self, transaction_chunk: &mut TransactionChunk) {
         match transaction_chunk.is_sender {
             Some(true) => {
-                // TODO: Check the stage. If it is really Aborted
-                // And the previous was WaitingForDecision, everything is undo (removeInbox + sendAbort)
-                // If it is WaitingForMessages, sendAbort, but no removeInbox
-                // If it is WaitingForProcessing, invalidate it and nothing needs to be done.
-                // If it is Registered, then just invalidate
                 match transaction_chunk.confirmed_stage {
-                    Some(stage) => {
-                        match stage{
-                            Registered => {
-                                if self.send_abort_submit(transaction_chunk).await { return; }
+                    Some(stage) => match stage {
+                        Registered => {
+                            if self.send_abort_submit(transaction_chunk, None).await {
+                                return;
                             }
-                            WaitingForMessages => {
-                                if self.send_abort_submit(transaction_chunk).await { return; }
-                                if self.remove_inbox_submit(transaction_chunk).await { return; }
-                            },
-                            _ => {}
                         }
-                    }
+                        WaitingForMessages => {
+                            let ack_dependency = self
+                                .lookup_mailbox_dependency(
+                                    transaction_chunk.instance_id.as_str(),
+                                    "ACK",
+                                )
+                                .await;
+                            if ack_dependency.is_none() {
+                                warn!(
+                                    transaction_chunk.instance_id,
+                                    "No ACK mailbox message found to removeInbox on abort"
+                                );
+                            }
+                            if self
+                                .send_abort_submit(transaction_chunk, ack_dependency.as_ref())
+                                .await
+                            {
+                                return;
+                            }
+                        }
+                        _ => {}
+                    },
                     None => {}
                 }
 
@@ -793,15 +956,21 @@ impl DefaultCoordinator {
                 // successfully putInbox'd the ACK — so it's always there to
                 // remove. Undoes that putInbox, mirroring `unwrite` compensating
                 // `writeMessage`.
-                self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Aborted).await;
+                self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Aborted)
+                    .await;
             }
             Some(false) => {
                 match transaction_chunk.confirmed_stage {
                     Some(stage) => {
-                        match stage{
+                        match stage {
                             WaitingForMessages => {
-                                let Some(receive_tx_bytes) = transaction_chunk.organised_transactions.get("receive") else {
-                                    warn!(transaction_chunk.instance_id, "No receive tx recorded for receiver abort, dropping");
+                                let Some(receive_tx_bytes) =
+                                    transaction_chunk.organised_transactions.get("receive")
+                                else {
+                                    warn!(
+                                        transaction_chunk.instance_id,
+                                        "No receive tx recorded for receiver abort, dropping"
+                                    );
                                     return;
                                 };
                                 let header = match Self::decode_receive_header(receive_tx_bytes) {
@@ -812,9 +981,54 @@ impl DefaultCoordinator {
                                     }
                                 };
 
+                                // Reaching Aborted here (is_sender == false) only happens
+                                // after process_xt already putInbox'd the original SEND
+                                // message, so it's always present to remove. removeInbox
+                                // requires the exact original payload, so re-match the
+                                // recorded mailbox message the same way process_xt did to
+                                // build the putInbox in the first place. The recvAbort and
+                                // removeInbox transactions are released to the builder
+                                // together.
+                                let mailbox_msg = {
+                                    let state = self.state.read().await;
+                                    state
+                                        .mailbox_messages
+                                        .get(transaction_chunk.instance_id.as_str())
+                                        .and_then(|msgs| {
+                                            msgs.iter().find(|msg| matches_dependency(msg, &header))
+                                        })
+                                        .cloned()
+                                };
+
+                                let send_dependency = match mailbox_msg {
+                                    Some(mailbox_msg) => Some(CrossRollupDependency {
+                                        data: Some(mailbox_msg.payload),
+                                        ..header.clone()
+                                    }),
+                                    None => {
+                                        warn!(transaction_chunk.instance_id, "No matching mailbox message found to removeInbox on abort");
+                                        None
+                                    }
+                                };
+
+                                let instance_id = transaction_chunk.instance_id.as_str();
                                 let result = match Self::receive_call_kind(receive_tx_bytes) {
-                                    Some(ReceiveCallKind::Tokens) => self.submit_recv_abort_token(&header).await,
-                                    Some(ReceiveCallKind::Eth) => self.submit_recv_abort_eth(&header).await,
+                                    Some(ReceiveCallKind::Tokens) => {
+                                        self.submit_recv_abort_token(
+                                            instance_id,
+                                            &header,
+                                            send_dependency.as_ref(),
+                                        )
+                                        .await
+                                    }
+                                    Some(ReceiveCallKind::Eth) => {
+                                        self.submit_recv_abort_eth(
+                                            instance_id,
+                                            &header,
+                                            send_dependency.as_ref(),
+                                        )
+                                        .await
+                                    }
                                     None => {
                                         warn!(transaction_chunk.instance_id, "Receive tx selector not recognised for abort, dropping");
                                         return;
@@ -824,74 +1038,42 @@ impl DefaultCoordinator {
                                 if let Err(e) = result {
                                     warn!(transaction_chunk.instance_id, error = %e, "Failed to submit recvAbort");
                                 }
-
-                                // Same reasoning as the sender side: reaching Aborted here
-                                // (is_sender == false) only happens after process_xt already
-                                // putInbox'd the original SEND message, so it's always
-                                // present to remove. removeInbox requires the exact original
-                                // payload, so re-match the recorded mailbox message the same
-                                // way process_xt did to build the putInbox in the first place.
-                                let mailbox_msg = {
-                                    let state = self.state.read().await;
-                                    state
-                                        .mailbox_messages
-                                        .get(transaction_chunk.instance_id.as_str())
-                                        .and_then(|msgs| msgs.iter().find(|msg| matches_dependency(msg, &header)))
-                                        .cloned()
-                                };
-
-                                match mailbox_msg {
-                                    Some(mailbox_msg) => {
-                                        let send_dependency = CrossRollupDependency {
-                                            data: Some(mailbox_msg.payload),
-                                            ..header
-                                        };
-                                        if let Err(e) = self.submit_remove_inbox(&send_dependency).await {
-                                            warn!(transaction_chunk.instance_id, error = %e, "Failed to submit removeInbox for SEND");
-                                            return;
-                                        }
-                                    }
-                                    None => {
-                                        warn!(transaction_chunk.instance_id, "No matching mailbox message found to removeInbox on abort");
-                                    }
-                                }
-                            },
+                            }
                             _ => {}
                         }
                     }
                     None => {}
                 }
 
-                self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Aborted).await;
+                self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Aborted)
+                    .await;
             }
             None => {
-                warn!(transaction_chunk.instance_id, "Chunk missing is_sender at abort, dropping");
+                warn!(
+                    transaction_chunk.instance_id,
+                    "Chunk missing is_sender at abort, dropping"
+                );
             }
         }
     }
 
-    async fn remove_inbox_submit(&self, transaction_chunk: &mut TransactionChunk) -> bool {
-        if let Some(ack_dependency) = self
-            .lookup_mailbox_dependency(transaction_chunk.instance_id.as_str(), "ACK")
-            .await
-        {
-            if let Err(e) = self.submit_remove_inbox(&ack_dependency).await {
-                warn!(transaction_chunk.instance_id, error = %e, "Failed to submit removeInbox for ACK");
-                return true;
-            }
-        } else {
-            warn!(transaction_chunk.instance_id, "No ACK mailbox message found to removeInbox on abort");
-        }
-        false
-    }
-
-    async fn send_abort_submit(&self, transaction_chunk: &mut TransactionChunk) -> bool {
+    async fn send_abort_submit(
+        &self,
+        transaction_chunk: &mut TransactionChunk,
+        remove_inbox_dependency: Option<&CrossRollupDependency>,
+    ) -> bool {
         let Some(bridge_tx_bytes) = transaction_chunk.organised_transactions.get("bridge") else {
-            warn!(transaction_chunk.instance_id, "No bridge tx recorded for sender abort, dropping");
+            warn!(
+                transaction_chunk.instance_id,
+                "No bridge tx recorded for sender abort, dropping"
+            );
             return true;
         };
         let Some((sender, _nonce)) = decode_sender_nonce(bridge_tx_bytes) else {
-            warn!(transaction_chunk.instance_id, "Failed to recover bridge tx signer for abort, dropping");
+            warn!(
+                transaction_chunk.instance_id,
+                "Failed to recover bridge tx signer for abort, dropping"
+            );
             return true;
         };
         let args = match Self::decode_bridge_call_args(bridge_tx_bytes) {
@@ -902,8 +1084,15 @@ impl DefaultCoordinator {
             }
         };
 
+        let instance_id = transaction_chunk.instance_id.as_str();
         let result = match args {
-            BridgeCallArgs::Token { chain_dest, token, amount, receiver, session_id } => {
+            BridgeCallArgs::Token {
+                chain_dest,
+                token,
+                amount,
+                receiver,
+                session_id,
+            } => {
                 let params = SendAbortTokenParams {
                     chain_dest,
                     token,
@@ -912,9 +1101,15 @@ impl DefaultCoordinator {
                     amount,
                     session_id,
                 };
-                self.submit_send_abort_token(&params).await
+                self.submit_send_abort_token(instance_id, &params, remove_inbox_dependency)
+                    .await
             }
-            BridgeCallArgs::Eth { chain_dest, amount, receiver, session_id } => {
+            BridgeCallArgs::Eth {
+                chain_dest,
+                amount,
+                receiver,
+                session_id,
+            } => {
                 let params = SendAbortEthParams {
                     chain_dest,
                     sender,
@@ -922,7 +1117,8 @@ impl DefaultCoordinator {
                     amount,
                     session_id,
                 };
-                self.submit_send_abort_eth(&params).await
+                self.submit_send_abort_eth(instance_id, &params, remove_inbox_dependency)
+                    .await
             }
         };
 
@@ -952,7 +1148,13 @@ impl DefaultCoordinator {
     /// `on_decision` already set it to the target `Confirmed`/`Aborted`
     /// value). Takes the write lock only for this single field update.
     async fn mark_confirmed_stage(&self, instance_id: &str, stage: ChunkStage) {
-        if let Some(chunk) = self.state.write().await.inflight_chunks.get_mut(instance_id) {
+        if let Some(chunk) = self
+            .state
+            .write()
+            .await
+            .inflight_chunks
+            .get_mut(instance_id)
+        {
             chunk.confirmed_stage = Some(stage);
         }
     }
@@ -989,43 +1191,53 @@ impl DefaultCoordinator {
             .map_err(|e| SimulationError::Other(format!("failed to decode tx: {e}")))?;
         let input = signed.input();
         if input.len() < 4 {
-            return Err(SimulationError::Other("bridge tx input too short".to_string()));
+            return Err(SimulationError::Other(
+                "bridge tx input too short".to_string(),
+            ));
         }
 
         if input[..4] == bridgeERC20ToCall::SELECTOR {
-            let call = bridgeERC20ToCall::abi_decode(input)
-                .map_err(|e| SimulationError::Other(format!("failed to decode bridgeERC20To call: {e}")))?;
+            let call = bridgeERC20ToCall::abi_decode(input).map_err(|e| {
+                SimulationError::Other(format!("failed to decode bridgeERC20To call: {e}"))
+            })?;
             Ok(BridgeCallArgs::Token {
-                chain_dest: ChainId(u64::try_from(call.chainDest)
-                    .map_err(|_| SimulationError::Other("chainDest does not fit in u64".to_string()))?),
+                chain_dest: ChainId(u64::try_from(call.chainDest).map_err(|_| {
+                    SimulationError::Other("chainDest does not fit in u64".to_string())
+                })?),
                 token: call.tokenSrc,
                 amount: call.amount,
                 receiver: call.receiver,
                 session_id: call.sessionId,
             })
         } else if input[..4] == bridgeCETToCall::SELECTOR {
-            let call = bridgeCETToCall::abi_decode(input)
-                .map_err(|e| SimulationError::Other(format!("failed to decode bridgeCETTo call: {e}")))?;
+            let call = bridgeCETToCall::abi_decode(input).map_err(|e| {
+                SimulationError::Other(format!("failed to decode bridgeCETTo call: {e}"))
+            })?;
             Ok(BridgeCallArgs::Token {
-                chain_dest: ChainId(u64::try_from(call.chainDest)
-                    .map_err(|_| SimulationError::Other("chainDest does not fit in u64".to_string()))?),
+                chain_dest: ChainId(u64::try_from(call.chainDest).map_err(|_| {
+                    SimulationError::Other("chainDest does not fit in u64".to_string())
+                })?),
                 token: call.cetTokenSrc,
                 amount: call.amount,
                 receiver: call.receiver,
                 session_id: call.sessionId,
             })
         } else if input[..4] == bridgeEthToCall::SELECTOR {
-            let call = bridgeEthToCall::abi_decode(input)
-                .map_err(|e| SimulationError::Other(format!("failed to decode bridgeEthTo call: {e}")))?;
+            let call = bridgeEthToCall::abi_decode(input).map_err(|e| {
+                SimulationError::Other(format!("failed to decode bridgeEthTo call: {e}"))
+            })?;
             Ok(BridgeCallArgs::Eth {
-                chain_dest: ChainId(u64::try_from(call.chainDest)
-                    .map_err(|_| SimulationError::Other("chainDest does not fit in u64".to_string()))?),
+                chain_dest: ChainId(u64::try_from(call.chainDest).map_err(|_| {
+                    SimulationError::Other("chainDest does not fit in u64".to_string())
+                })?),
                 amount: signed.value(),
                 receiver: call.receiver,
                 session_id: call.sessionId,
             })
         } else {
-            Err(SimulationError::Other("tx is not a bridge...To call".to_string()))
+            Err(SimulationError::Other(
+                "tx is not a bridge...To call".to_string(),
+            ))
         }
     }
 
@@ -1305,8 +1517,16 @@ impl DefaultCoordinator {
             }
 
             xt.simulated_at = Some(std::time::Instant::now());
-            let simulation_duration = xt.simulated_at.unwrap().duration_since(xt.created_at).as_secs_f64();
-            info!(instance_id,simulation_duration_ms = (simulation_duration * 1000.0) as u64,"Finished simulating cTx:");
+            let simulation_duration = xt
+                .simulated_at
+                .unwrap()
+                .duration_since(xt.created_at)
+                .as_secs_f64();
+            info!(
+                instance_id,
+                simulation_duration_ms = (simulation_duration * 1000.0) as u64,
+                "Finished simulating cTx:"
+            );
             xt.vote_sent = true;
             xt.local_vote = Some(vote);
             xt.locked_chains.insert(self.chain_id);
@@ -1713,7 +1933,12 @@ mod tests {
             state.pending.insert(xt.id.clone(), xt);
         }
 
-        coordinator.register_xt(&mut TransactionChunk { instance_id: "xt-77777-10".to_string(), ..Default::default() }).await;
+        coordinator
+            .register_xt(&mut TransactionChunk {
+                instance_id: "xt-77777-10".to_string(),
+                ..Default::default()
+            })
+            .await;
 
         let state = coordinator.state.read().await;
         let xt = state.pending.get("xt-77777-10").unwrap();
@@ -1747,7 +1972,12 @@ mod tests {
             state.pending.insert(xt.id.clone(), xt);
         }
 
-        coordinator.register_xt(&mut TransactionChunk { instance_id: "xt-77777-verify".to_string(), ..Default::default() }).await;
+        coordinator
+            .register_xt(&mut TransactionChunk {
+                instance_id: "xt-77777-verify".to_string(),
+                ..Default::default()
+            })
+            .await;
 
         server.assert_hits(1);
         let state = coordinator.state.read().await;
@@ -1782,7 +2012,12 @@ mod tests {
             state.pending.insert(xt.id.clone(), xt);
         }
 
-        coordinator.register_xt(&mut TransactionChunk { instance_id: "xt-77777-reject".to_string(), ..Default::default() }).await;
+        coordinator
+            .register_xt(&mut TransactionChunk {
+                instance_id: "xt-77777-reject".to_string(),
+                ..Default::default()
+            })
+            .await;
 
         server.assert_hits(1);
         let state = coordinator.state.read().await;
@@ -1811,7 +2046,12 @@ mod tests {
             state.pending.insert(xt.id.clone(), xt);
         }
 
-        coordinator.register_xt(&mut TransactionChunk { instance_id: "xt-77777-11".to_string(), ..Default::default() }).await;
+        coordinator
+            .register_xt(&mut TransactionChunk {
+                instance_id: "xt-77777-11".to_string(),
+                ..Default::default()
+            })
+            .await;
 
         let state = coordinator.state.read().await;
         let xt = state.pending.get("xt-77777-11").unwrap();
@@ -1839,7 +2079,12 @@ mod tests {
             state.pending.insert(xt.id.clone(), xt);
         }
 
-        coordinator.register_xt(&mut TransactionChunk { instance_id: "xt-77777-12".to_string(), ..Default::default() }).await;
+        coordinator
+            .register_xt(&mut TransactionChunk {
+                instance_id: "xt-77777-12".to_string(),
+                ..Default::default()
+            })
+            .await;
 
         let state = coordinator.state.read().await;
         let xt = state.pending.get("xt-77777-12").unwrap();
@@ -1910,7 +2155,12 @@ mod tests {
             state.pending.insert(xt.id.clone(), xt);
         }
 
-        coordinator.register_xt(&mut TransactionChunk { instance_id: "xt-77777-13".to_string(), ..Default::default() }).await;
+        coordinator
+            .register_xt(&mut TransactionChunk {
+                instance_id: "xt-77777-13".to_string(),
+                ..Default::default()
+            })
+            .await;
 
         let seen = simulator.seen_overrides.lock().unwrap();
         assert_eq!(seen.len(), 2);
@@ -1969,7 +2219,10 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            coordinator.register_xt(&mut TransactionChunk { instance_id: "xt-77777-14".to_string(), ..Default::default() }),
+            coordinator.register_xt(&mut TransactionChunk {
+                instance_id: "xt-77777-14".to_string(),
+                ..Default::default()
+            }),
         )
         .await
         .expect("register_xt should not wait for already-fulfilled deps");

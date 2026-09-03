@@ -21,6 +21,12 @@ struct SubmitXtRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct FollowupXtRequest {
+    instance_id: String,
+    transactions: Vec<Bytes>,
+}
+
+#[derive(Debug, Serialize)]
 struct ReleaseXtRequest {
     instance_id: String,
     transactions: Vec<Bytes>,
@@ -29,13 +35,6 @@ struct ReleaseXtRequest {
 #[derive(Debug, Serialize)]
 struct AbortXtRequest {
     instance_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SubmitBundleRequest {
-    instance_id: String,
-    order: XtOrderKey,
-    transactions: Vec<Bytes>,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,26 +141,26 @@ impl XtBuilderClient for HttpXtBuilderClient {
     }
 
     async fn submit_tx(&self, tx: &[u8]) -> Result<(), CoordinatorError> {
-        self.call("eth_sendRawTransaction", Bytes::copy_from_slice(tx)).await
+        self.call("eth_sendRawTransaction", Bytes::copy_from_slice(tx))
+            .await
     }
 
-    async fn submit_ordered_bundle(
+    async fn submit_followup_xt(
         &self,
         instance_id: &str,
-        period_id: u64,
-        sequence_number: u64,
-        transactions: Vec<Vec<u8>>,
+        put_inbox_transactions: Vec<Vec<u8>>,
     ) -> Result<(), CoordinatorError> {
-        let request = SubmitBundleRequest {
-            instance_id: instance_id.to_string(),
-            order: XtOrderKey {
-                period_id,
-                sequence_number,
+        self.call(
+            "ethera_submitFollowup",
+            FollowupXtRequest {
+                instance_id: instance_id.to_string(),
+                transactions: put_inbox_transactions
+                    .into_iter()
+                    .map(Bytes::from)
+                    .collect(),
             },
-            transactions: transactions.into_iter().map(Bytes::from).collect(),
-        };
-
-        self.call("ethera_submitOrderedBundle", request).await
+        )
+        .await
     }
 
     async fn release_xt(

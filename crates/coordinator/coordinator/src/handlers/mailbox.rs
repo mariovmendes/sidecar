@@ -5,9 +5,9 @@ use compose_primitives::CrossRollupDependency;
 use compose_proto::MailboxMessage;
 use tracing::{debug, warn};
 
+use crate::coordinator::ChunkStage::{WaitingForMessages, WaitingForProcessing};
 use crate::coordinator::DefaultCoordinator;
 use compose_primitives_traits::CoordinatorError;
-use crate::coordinator::ChunkStage::{WaitingForMessages, WaitingForProcessing};
 
 impl DefaultCoordinator {
     /// Handle an ACK `CrossRollupDependency` reported by a peer sidecar right
@@ -44,14 +44,17 @@ impl DefaultCoordinator {
                 .or_default()
                 .push(mailbox_msg);
 
-            state.inflight_chunks.get_mut(instance_id.as_str()).is_some_and(|chunk| {
-                if chunk.stage == WaitingForMessages {
-                    chunk.stage = WaitingForProcessing;
-                    true
-                } else {
-                    false
-                }
-            })
+            state
+                .inflight_chunks
+                .get_mut(instance_id.as_str())
+                .is_some_and(|chunk| {
+                    if chunk.stage == WaitingForMessages {
+                        chunk.stage = WaitingForProcessing;
+                        true
+                    } else {
+                        false
+                    }
+                })
         };
 
         match (advanced, &self.chunk_sender) {
@@ -61,7 +64,10 @@ impl DefaultCoordinator {
                 }
             }
             (true, None) => {
-                warn!(instance_id, "No chunk sender configured, ack recorded but not scheduled for processing");
+                warn!(
+                    instance_id,
+                    "No chunk sender configured, ack recorded but not scheduled for processing"
+                );
             }
             (false, _) => {
                 warn!(instance_id, "No inflight chunk found for ack, dropping");
@@ -76,12 +82,6 @@ impl DefaultCoordinator {
         &self,
         msg: &MailboxMessage,
     ) -> Result<(), CoordinatorError> {
-        // Publisher-assigned instance IDs are a raw SHA256 digest (see
-        // `generate_instance_id` in publisher's spec-sbcp), not UTF-8 text.
-        // Every other map (`state.pending`, `state.inflight_chunks`,
-        // `mailbox_index`) is keyed by `hex::encode` of that digest — see
-        // `InstanceId::from_publisher_bytes` — so recover the key the same
-        // way here instead of (incorrectly) UTF-8-decoding the raw bytes.
         let instance_id = hex::encode(&msg.instance_id);
 
         debug!(
@@ -105,7 +105,7 @@ impl DefaultCoordinator {
 
         // Record the message and, if the matching chunk is already sitting in
         // WaitingForMessages (registered via register_xt, waiting on exactly
-        // this dependency), advance it and re-enqueue it — without holding the
+        // this dependency), advance it and re-enqueue it without holding the
         // state lock across the channel send below.
         let advanced = {
             let mut state = self.state.write().await;
@@ -115,14 +115,17 @@ impl DefaultCoordinator {
                 .or_default()
                 .push(msg.clone());
 
-            state.inflight_chunks.get_mut(instance_id.as_str()).is_some_and(|chunk| {
-                if chunk.stage == WaitingForMessages {
-                    chunk.stage = WaitingForProcessing;
-                    true
-                } else {
-                    false
-                }
-            })
+            state
+                .inflight_chunks
+                .get_mut(instance_id.as_str())
+                .is_some_and(|chunk| {
+                    if chunk.stage == WaitingForMessages {
+                        chunk.stage = WaitingForProcessing;
+                        true
+                    } else {
+                        false
+                    }
+                })
         };
 
         match (advanced, &self.chunk_sender) {
@@ -132,10 +135,16 @@ impl DefaultCoordinator {
                 }
             }
             (true, None) => {
-                warn!(instance_id, "No chunk sender configured, message recorded but not scheduled for processing");
+                warn!(
+                    instance_id,
+                    "No chunk sender configured, message recorded but not scheduled for processing"
+                );
             }
             (false, _) => {
-                debug!(instance_id, "No inflight chunk waiting on this instance yet");
+                debug!(
+                    instance_id,
+                    "No inflight chunk waiting on this instance yet"
+                );
             }
         }
 

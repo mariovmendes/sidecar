@@ -1,9 +1,9 @@
 //! Start-instance handling and sequencing validation.
 
-use std::collections::HashMap;
-use tokio::sync::mpsc::Sender;
 use compose_primitives::{ChainId, InstanceId, PeriodId, SequenceNumber};
 use compose_proto::StartInstance;
+use std::collections::HashMap;
+use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info, warn};
 
 use crate::coordinator::DefaultCoordinator;
@@ -18,7 +18,11 @@ const MAX_PENDING_XTS: usize = 100;
 impl DefaultCoordinator {
     /// Process a new instance from the publisher. Validates the period and
     /// sequence, decodes transactions, and registers the XT.
-    pub async fn handle_start_instance(&self, msg: &StartInstance, sender: &Sender<String>) -> Result<(), CoordinatorError> {
+    pub async fn handle_start_instance(
+        &self,
+        msg: &StartInstance,
+        sender: &Sender<String>,
+    ) -> Result<(), CoordinatorError> {
         let instance_id = InstanceId::from_publisher_bytes(&msg.instance_id);
         let xt_request = msg
             .xt_request
@@ -172,8 +176,6 @@ impl DefaultCoordinator {
             m.xt_pending_count.inc();
         }
 
-
-
         // Release the write lock before spawning so register_xt can acquire it.
         drop(state);
 
@@ -234,9 +236,9 @@ impl DefaultCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::mpsc;
     use compose_primitives::{ChainId, PeriodId};
     use compose_proto::{StartInstance, TransactionRequest, XtRequest};
+    use tokio::sync::mpsc;
 
     use crate::coordinator::{DefaultCoordinator, VerificationConfig};
 
@@ -273,7 +275,7 @@ mod tests {
             state.current_period_id = PeriodId(1);
         }
 
-        let (tx, mut rx) = mpsc::channel::<String>(300);
+        let (tx, _rx) = mpsc::channel::<String>(300);
 
         coordinator
             .handle_start_instance(&start_instance(1), &tx)
