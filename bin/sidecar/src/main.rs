@@ -15,6 +15,7 @@ use compose_mailbox::put_inbox::PutInboxTxBuilder;
 use compose_mailbox::queue::InMemoryQueue;
 use compose_metrics::SidecarMetrics;
 use compose_peer::coordinator::{HttpPeerCoordinator, PeerEntry as RuntimePeerEntry};
+use compose_primitives::xtflow;
 use compose_peer::sender::PeerMailboxSender;
 use compose_publisher::PublisherConnection;
 use compose_server::handlers::publisher::handle_publisher_message;
@@ -45,10 +46,15 @@ async fn main() -> Result<()> {
 
     let (mut coordinator, quic_client) = build_coordinator(&args, metrics)?;
 
-    coordinator.start().await?;
-
+    // The chunk sender must be attached *before* `start()`: that spawns the
+    // cleanup and watchdog tasks from a clone of the coordinator, and
+    // `chunk_sender` is a plain field, so anything set afterwards is invisible
+    // to them. With the order reversed the watchdog could log its finalization
+    // retries but never enqueue them.
     let (tx, rx) = mpsc::channel::<String>(300);
     coordinator.set_chunk_sender(tx.clone());
+
+    coordinator.start().await?;
 
     let coordinator_arc = Arc::new(coordinator);
 
@@ -262,13 +268,27 @@ fn spawn_chunk_processor(coordinator: Arc<DefaultCoordinator>, mut rx: Receiver<
             // it lands in the `Some` arm instead and is re-dispatched on its
             // real current stage, so it can never be mistaken for a fresh
             // registration.
+            let dispatch_started = std::time::Instant::now();
             match coordinator.get_inflight_chunk(&instance_id).await {
                 Some(mut chunk) => {
                     if chunk.confirmed_stage == Some(chunk.stage) {
                         // Already fully processed for this stage; a
                         // duplicate/late signal, nothing new to do.
+                        xtflow!(
+                            "dispatch_skip",
+                            instance_id = instance_id,
+                            chunk_stage = format!("{:?}", chunk.stage),
+                            confirmed_stage = format!("{:?}", chunk.confirmed_stage),
+                        );
                         continue;
                     }
+                    xtflow!(
+                        "dispatch",
+                        instance_id = instance_id,
+                        chunk_stage = format!("{:?}", chunk.stage),
+                        confirmed_stage = format!("{:?}", chunk.confirmed_stage),
+                        is_sender = format!("{:?}", chunk.is_sender),
+                    );
                     match chunk.stage {
                         WaitingForProcessing => {
                             coordinator.process_xt(&mut chunk).await;
@@ -279,10 +299,20 @@ fn spawn_chunk_processor(coordinator: Arc<DefaultCoordinator>, mut rx: Receiver<
                         Aborted => {
                             coordinator.abort_xt(&mut chunk).await;
                         }
-                        _ => {}
+                        other => {
+                            // Nothing to run at this stage — the signal only
+                            // means "something changed", and WaitingForMessages
+                            // /WaitingForDecided are waited on, not driven.
+                            xtflow!(
+                                "dispatch_noop",
+                                instance_id = instance_id,
+                                chunk_stage = format!("{other:?}"),
+                            );
+                        }
                     }
                 }
                 None => {
+                    xtflow!("dispatch", instance_id = instance_id, chunk_stage = "Registered");
                     let mut chunk = TransactionChunk {
                         instance_id: instance_id.clone(),
                         stage: Registered,
@@ -291,6 +321,12 @@ fn spawn_chunk_processor(coordinator: Arc<DefaultCoordinator>, mut rx: Receiver<
                     coordinator.register_xt(&mut chunk).await;
                 }
             }
+            xtflow!(
+                "dispatch_done",
+                instance_id = instance_id,
+                took_ms = dispatch_started.elapsed().as_millis(),
+                queued = rx.len(),
+            );
         }
     });
 }

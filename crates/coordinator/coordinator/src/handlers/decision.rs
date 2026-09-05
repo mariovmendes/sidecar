@@ -3,6 +3,7 @@
 use tracing::{info, warn};
 
 use crate::coordinator::DefaultCoordinator;
+use compose_primitives::xtflow;
 use compose_primitives_traits::CoordinatorError;
 use crate::coordinator::ChunkStage::{Aborted, Confirmed};
 
@@ -16,12 +17,23 @@ impl DefaultCoordinator {
         {
             let mut state = self.state.write().await;
 
-            let xt = state
-                .pending
-                .get_mut(instance_id)
-                .ok_or_else(|| CoordinatorError::InstanceNotFound(instance_id.to_string()))?;
+            let Some(xt) = state.pending.get_mut(instance_id) else {
+                xtflow!(
+                    "decision_unknown_instance",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    decision = decision,
+                );
+                return Err(CoordinatorError::InstanceNotFound(instance_id.to_string()));
+            };
 
             if xt.decision.is_some() {
+                xtflow!(
+                    "decision_duplicate",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    decision = decision,
+                );
                 info!(instance_id, "Decision already recorded, ignoring duplicate");
                 return Ok(());
             }
@@ -45,6 +57,14 @@ impl DefaultCoordinator {
             let latency = xt.created_at.elapsed();
             xt.record_decision(decision);
 
+            xtflow!(
+                "decision",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                decision = decision,
+                latency_ms = latency.as_millis(),
+                local_vote = format!("{:?}", xt.local_vote),
+            );
             info!(instance_id, decision, "Decision received");
 
             if let Some(m) = &self.metrics {
@@ -61,20 +81,31 @@ impl DefaultCoordinator {
             // yet, there's nothing to stamp — register_xt will notice
             // `xt.decision` is already set once it reaches its checkpoint.
             let Some(chunk) = state.inflight_chunks.get_mut(instance_id) else {
+                // register_xt/process_xt will reconcile against xt.decision
+                // when they reach their own checkpoint.
+                xtflow!(
+                    "decision_no_chunk_yet",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    decision = decision,
+                );
                 return Ok(());
             };
             chunk.stage = if decision { Confirmed } else { Aborted };
         };
 
         let Some(sender) = self.chunk_sender.as_ref() else {
+            xtflow!("signal_failed", instance_id = instance_id, chain = self.chain_id, from = "decision", error = "no_chunk_sender");
             warn!(instance_id, "No chunk sender configured, dropping");
             return Err(CoordinatorError::ChunkSenderNotSet(instance_id.to_string()));
         };
 
         if let Err(e) = sender.send(instance_id.to_string()).await {
+            xtflow!("signal_failed", instance_id = instance_id, chain = self.chain_id, from = "decision", error = e);
             warn!(instance_id, error = %e, "Failed to enqueue chunk for processing");
             return Err(CoordinatorError::QueueError(instance_id.to_string()));
         }
+        xtflow!("signal_enqueued", instance_id = instance_id, chain = self.chain_id, from = "decision");
 
         /*if let Some(command) = builder_command {
             self.apply_builder_command(command).await?;

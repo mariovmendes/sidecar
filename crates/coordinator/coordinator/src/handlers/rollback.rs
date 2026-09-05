@@ -55,10 +55,11 @@ impl DefaultCoordinator {
             .await?;
         }
 
-        if let Err(err) = self.resync_put_inbox_nonce().await {
-            warn!(error = %err, "Failed to resync putInbox nonce after rollback");
-            self.nonce_manager.reset().await;
-        }
+        // A rollback rewinds the chain itself and aborts the pending instances
+        // at the builder just above, so every locally reserved nonce is void.
+        // Drop the counter entirely (including recycled nonces) and let the
+        // next reservation re-read the builder's expected next nonce.
+        self.nonce_manager.reset().await;
 
         for waiters in pending_submissions.into_values() {
             Self::notify_pending_submission_waiters(

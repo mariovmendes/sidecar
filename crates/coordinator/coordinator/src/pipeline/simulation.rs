@@ -5,7 +5,8 @@ use crate::coordinator::ChunkStage::{
 };
 use crate::coordinator::{ChunkStage, DefaultCoordinator, TransactionChunk};
 use crate::model::chain_overlay::ChainOverlay;
-use crate::pipeline::delivery::decode_sender_nonce;
+use crate::pipeline::delivery::{decode_sender_nonce, describe_local_txs};
+use compose_primitives::xtflow;
 use alloy::consensus::{Transaction, TxEnvelope};
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::{SolCall, SolValue};
@@ -33,6 +34,18 @@ struct VerificationPayload<'a> {
     dest_chain_id: u64,
     origin_chain_id: Option<u64>,
     txs: Vec<String>,
+}
+
+/// Result of trying to put an XT's compensation on chain.
+enum Compensation {
+    /// The compensating transaction was handed to the builder.
+    Submitted,
+    /// There is nothing to compensate — nothing of this instance ever reached
+    /// the builder, so no funds are escrowed.
+    NotApplicable,
+    /// The attempt failed and must be retried: funds may be escrowed with no
+    /// refund in flight.
+    Failed,
 }
 
 /// Which receive-leg call a `"receive"` chunk entry decodes to.
@@ -91,6 +104,11 @@ impl DefaultCoordinator {
     /// Run the simulation pipeline for the local chain's portion of an XT.
     ///
     pub async fn register_xt(&self, transaction_chunk: &mut TransactionChunk) {
+        xtflow!(
+            "register_begin",
+            instance_id = transaction_chunk.instance_id,
+            chain = self.chain_id,
+        );
         info!(transaction_chunk.instance_id, chain_id = %self.chain_id, "Processing XT");
 
         // Capture everything we need from state in a single read lock. Start
@@ -239,6 +257,22 @@ impl DefaultCoordinator {
                 transaction_chunk.clone(),
             );
         }
+        let mut roles: Vec<&String> = transaction_chunk.organised_transactions.keys().collect();
+        roles.sort();
+        xtflow!(
+            "stage",
+            instance_id = transaction_chunk.instance_id,
+            chain = self.chain_id,
+            from = "Registered",
+            to = "WaitingForMessages",
+            is_sender = format!("{:?}", transaction_chunk.is_sender),
+            roles = roles
+                .iter()
+                .map(|r| r.as_str())
+                .collect::<Vec<_>>()
+                .join("+"),
+            mailbox_already_present = received_message_xt,
+        );
 
         // A Decided(false) may have raced ahead of register_xt and already
         // been recorded on `xt.decision` by on_decision, before any chunk
@@ -255,6 +289,11 @@ impl DefaultCoordinator {
                 .and_then(|xt| xt.decision)
         };
         if already_decided == Some(false) {
+            xtflow!(
+                "register_pre_aborted",
+                instance_id = transaction_chunk.instance_id,
+                chain = self.chain_id,
+            );
             info!(
                 transaction_chunk.instance_id,
                 "Decision already recorded as abort before submission, skipping"
@@ -309,6 +348,17 @@ impl DefaultCoordinator {
                     .cloned();
                 if let Some(bridge_tx_bytes) = &bridge_tx_bytes {
                     txs_to_submit.push(bridge_tx_bytes.clone());
+                    let submitted = describe_local_txs(self.chain_id, &txs_to_submit);
+                    xtflow!(
+                        "builder_submit",
+                        instance_id = transaction_chunk.instance_id,
+                        chain = self.chain_id,
+                        call = "ethera_submitXt",
+                        period = period_id,
+                        seq = sequence_number,
+                        tx_count = txs_to_submit.len(),
+                        txs = submitted,
+                    );
                     match builder
                         .submit_locked_xt(
                             transaction_chunk.instance_id.as_str(),
@@ -319,6 +369,12 @@ impl DefaultCoordinator {
                         .await
                     {
                         Ok(()) => {
+                            xtflow!(
+                                "builder_submit_ok",
+                                instance_id = transaction_chunk.instance_id,
+                                chain = self.chain_id,
+                                call = "ethera_submitXt",
+                            );
                             self.notify_outbound_dependency(
                                 &simulator,
                                 transaction_chunk.instance_id.as_str(),
@@ -328,6 +384,13 @@ impl DefaultCoordinator {
                             .await;
                         }
                         Err(e) => {
+                            xtflow!(
+                                "builder_submit_err",
+                                instance_id = transaction_chunk.instance_id,
+                                chain = self.chain_id,
+                                call = "ethera_submitXt",
+                                error = e,
+                            );
                             warn!(
                                 transaction_chunk.instance_id,
                                 error = %e,
@@ -359,6 +422,12 @@ impl DefaultCoordinator {
         bridge_tx_bytes: &[u8],
     ) {
         let Some(mailbox_sender) = &self.mailbox_sender else {
+            xtflow!(
+                "mailbox_out_skip",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                reason = "no_mailbox_sender",
+            );
             return;
         };
 
@@ -374,10 +443,24 @@ impl DefaultCoordinator {
                     }
                 }
                 Ok(result) => {
+                    xtflow!(
+                        "mailbox_out_skip",
+                        instance_id = instance_id,
+                        chain = self.chain_id,
+                        reason = "approve_simulation_failed",
+                        error = format!("{:?}", result.error),
+                    );
                     warn!(instance_id, error = ?result.error, "Approve simulation failed, skipping outbound ack");
                     return;
                 }
                 Err(e) => {
+                    xtflow!(
+                        "mailbox_out_skip",
+                        instance_id = instance_id,
+                        chain = self.chain_id,
+                        reason = "approve_simulation_error",
+                        error = e,
+                    );
                     warn!(instance_id, error = %e, "Failed to simulate approve, skipping outbound ack");
                     return;
                 }
@@ -390,22 +473,48 @@ impl DefaultCoordinator {
         {
             Ok(result) if result.success => result,
             Ok(result) => {
+                xtflow!(
+                    "mailbox_out_skip",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    reason = "bridge_simulation_failed",
+                    error = format!("{:?}", result.error),
+                );
                 warn!(instance_id, error = ?result.error, "Bridge simulation failed, skipping outbound ack");
                 return;
             }
             Err(e) => {
+                xtflow!(
+                    "mailbox_out_skip",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    reason = "bridge_simulation_error",
+                    error = e,
+                );
                 warn!(instance_id, error = %e, "Failed to simulate bridge tx, skipping outbound ack");
                 return;
             }
         };
 
         if bridge_result.outbound_messages.is_empty() {
+            xtflow!(
+                "mailbox_out_skip",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                reason = "no_outbound_messages",
+            );
             return;
         }
 
         let raw_instance_id = {
             let state = self.state.read().await;
             let Some(xt) = state.pending.get(instance_id) else {
+                xtflow!(
+                    "mailbox_out_skip",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    reason = "xt_gone",
+                );
                 return;
             };
             xt.instance_id.clone()
@@ -423,12 +532,37 @@ impl DefaultCoordinator {
                 session_id: wire::encode_session_id(msg.session_id),
             };
 
+            xtflow!(
+                "mailbox_out",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                dest_chain = msg.dest_chain_id,
+                label = msg.label,
+                session = msg.session_id,
+                path = "POST /mailbox",
+            );
             if let Err(e) = mailbox_sender.send(msg.dest_chain_id, &mailbox_msg).await {
+                xtflow!(
+                    "mailbox_out_err",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    dest_chain = msg.dest_chain_id,
+                    label = msg.label,
+                    error = e,
+                );
                 warn!(
                     instance_id,
                     dest_chain = %msg.dest_chain_id,
                     error = %e,
                     "Failed to send outbound mailbox message to peer"
+                );
+            } else {
+                xtflow!(
+                    "mailbox_out_ok",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    dest_chain = msg.dest_chain_id,
+                    label = msg.label,
                 );
             }
         }
@@ -448,9 +582,21 @@ impl DefaultCoordinator {
         receive_tx_bytes: &[u8],
     ) {
         let Some(mailbox_sender) = &self.mailbox_sender else {
+            xtflow!(
+                "ack_out_skip",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                reason = "no_mailbox_sender",
+            );
             return;
         };
         let Some(send_payload) = dependency.data.as_ref() else {
+            xtflow!(
+                "ack_out_skip",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                reason = "dependency_without_payload",
+            );
             return;
         };
 
@@ -501,15 +647,37 @@ impl DefaultCoordinator {
             session_id: dependency.session_id,
         };
 
+        xtflow!(
+            "ack_out",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            dest_chain = dependency.source_chain_id,
+            session = dependency.session_id,
+            path = "POST /mailbox/ack",
+        );
         if let Err(e) = mailbox_sender
             .send_ack(dependency.source_chain_id, instance_id, &ack_dependency)
             .await
         {
+            xtflow!(
+                "ack_out_err",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                dest_chain = dependency.source_chain_id,
+                error = e,
+            );
             warn!(
                 instance_id,
                 dest_chain = %dependency.source_chain_id,
                 error = %e,
                 "Failed to send ACK to peer"
+            );
+        } else {
+            xtflow!(
+                "ack_out_ok",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                dest_chain = dependency.source_chain_id,
             );
         }
     }
@@ -567,6 +735,13 @@ impl DefaultCoordinator {
     }
 
     pub async fn process_xt(&self, transaction_chunk: &mut TransactionChunk) {
+        xtflow!(
+            "process_begin",
+            instance_id = transaction_chunk.instance_id,
+            chain = self.chain_id,
+            is_sender = format!("{:?}", transaction_chunk.is_sender),
+            confirmed_stage = format!("{:?}", transaction_chunk.confirmed_stage),
+        );
         if let Some(builder) = &self.xt_builder_client {
             if let Some(val) = transaction_chunk.is_sender {
                 if val {
@@ -595,11 +770,29 @@ impl DefaultCoordinator {
                             .await;
 
                         match ack_dependency {
-                            Some(dep) => Some(
-                                self.handle_dependency(transaction_chunk.instance_id.as_str(), dep)
+                            Some(dep) => {
+                                xtflow!(
+                                    "put_inbox_ack",
+                                    instance_id = transaction_chunk.instance_id,
+                                    chain = self.chain_id,
+                                    session = dep.session_id,
+                                    label = String::from_utf8_lossy(&dep.label),
+                                );
+                                Some(
+                                    self.handle_dependency(
+                                        transaction_chunk.instance_id.as_str(),
+                                        dep,
+                                    )
                                     .await,
-                            ),
+                                )
+                            }
                             None => {
+                                xtflow!(
+                                    "process_reject",
+                                    instance_id = transaction_chunk.instance_id,
+                                    chain = self.chain_id,
+                                    reason = "no_ack_mailbox_message",
+                                );
                                 warn!("No ackSend tx or mailbox ACK found for instance, rejecting");
                                 let _ = self
                                     .send_vote(transaction_chunk.instance_id.as_str(), false)
@@ -610,18 +803,40 @@ impl DefaultCoordinator {
                     };
 
                     if let Some(Err(e)) = put_inbox_result {
+                        xtflow!(
+                            "put_inbox_err",
+                            instance_id = transaction_chunk.instance_id,
+                            chain = self.chain_id,
+                            side = "sender",
+                            error = e,
+                        );
                         warn!("Failed to submit putInbox tx: {e}");
                         let _ = self
                             .send_vote(transaction_chunk.instance_id.as_str(), false)
                             .await;
                         return;
                     }
+                    xtflow!(
+                        "put_inbox_ok",
+                        instance_id = transaction_chunk.instance_id,
+                        chain = self.chain_id,
+                        side = "sender",
+                        call = "ethera_submitFollowup",
+                    );
 
                     let _ = self
                         .send_vote(transaction_chunk.instance_id.as_str(), true)
                         .await;
                     transaction_chunk.confirmed_stage = Some(WaitingForMessages);
                     transaction_chunk.stage = WaitingForDecided;
+                    xtflow!(
+                        "stage",
+                        instance_id = transaction_chunk.instance_id,
+                        chain = self.chain_id,
+                        from = "WaitingForMessages",
+                        to = "WaitingForDecided",
+                        side = "sender",
+                    );
                     self.state.write().await.inflight_chunks.insert(
                         transaction_chunk.instance_id.clone(),
                         transaction_chunk.clone(),
@@ -673,6 +888,22 @@ impl DefaultCoordinator {
                     };
 
                     let Some(mailbox_msg) = mailbox_msg else {
+                        xtflow!(
+                            "process_reject",
+                            instance_id = transaction_chunk.instance_id,
+                            chain = self.chain_id,
+                            reason = "no_matching_mailbox_message",
+                            want_session = expected_dependency.session_id,
+                            want_label = String::from_utf8_lossy(&expected_dependency.label),
+                            recorded = self
+                                .state
+                                .read()
+                                .await
+                                .mailbox_messages
+                                .get(transaction_chunk.instance_id.as_str())
+                                .map(Vec::len)
+                                .unwrap_or(0),
+                        );
                         warn!("No matching mailbox message recorded for instance, rejecting");
                         let _ = self
                             .send_vote(transaction_chunk.instance_id.as_str(), false)
@@ -692,10 +923,20 @@ impl DefaultCoordinator {
                     // them separately via submit_tx only orders their arrival at the
                     // pool, not their execution order, so we bundle them into a single
                     // atomically-ordered submission instead.
-                    let put_inbox_tx = match self.build_put_inbox_transaction(&dependency).await {
-                        Ok(tx) => tx,
+                    let (put_inbox_tx, put_inbox_nonce) = match self
+                        .build_put_inbox_transaction_with_nonce(&dependency)
+                        .await
+                    {
+                        Ok(built) => built,
                         Err(e) => {
-                            if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                            xtflow!(
+                                "put_inbox_build_err",
+                                instance_id = transaction_chunk.instance_id,
+                                chain = self.chain_id,
+                                side = "receiver",
+                                error = e,
+                            );
+                            if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
                                 warn!(error = %resync_err, "Failed to resync putInbox nonce after build error");
                             }
                             warn!("Failed to build putInbox tx: {e}");
@@ -725,6 +966,17 @@ impl DefaultCoordinator {
                             .unwrap_or((0, 0))
                     };
 
+                    xtflow!(
+                        "builder_submit",
+                        instance_id = transaction_chunk.instance_id,
+                        chain = self.chain_id,
+                        call = "ethera_submitXt",
+                        side = "receiver",
+                        period = period_id,
+                        seq = sequence_number,
+                        tx_count = txs_to_submit.len(),
+                        txs = describe_local_txs(self.chain_id, &txs_to_submit),
+                    );
                     if let Err(e) = builder
                         .submit_locked_xt(
                             transaction_chunk.instance_id.as_str(),
@@ -734,7 +986,23 @@ impl DefaultCoordinator {
                         )
                         .await
                     {
-                        if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                        xtflow!(
+                            "builder_submit_err",
+                            instance_id = transaction_chunk.instance_id,
+                            chain = self.chain_id,
+                            call = "ethera_submitXt",
+                            side = "receiver",
+                            error = e,
+                        );
+                        // The bundle carries the coordinator's putInbox: when
+                        // the builder refuses it outright, that nonce was never
+                        // used and must go back, or it becomes a hole the whole
+                        // chain's coordinator sequence stalls behind.
+                        if e.is_builder_rejection() {
+                            self.recycle_nonce(put_inbox_nonce, 1, "receive_bundle_rejected")
+                                .await;
+                        }
+                        if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
                             warn!(error = %resync_err, "Failed to resync putInbox nonce after submit error");
                         }
                         warn!("Failed to submit putInbox+receive bundle: {e}");
@@ -743,6 +1011,13 @@ impl DefaultCoordinator {
                             .await;
                         return;
                     }
+                    xtflow!(
+                        "builder_submit_ok",
+                        instance_id = transaction_chunk.instance_id,
+                        chain = self.chain_id,
+                        call = "ethera_submitXt",
+                        side = "receiver",
+                    );
                     self.notify_receive_ack(
                         transaction_chunk.instance_id.as_str(),
                         &dependency,
@@ -755,6 +1030,14 @@ impl DefaultCoordinator {
                         .await;
                     transaction_chunk.confirmed_stage = Some(WaitingForMessages);
                     transaction_chunk.stage = WaitingForDecided;
+                    xtflow!(
+                        "stage",
+                        instance_id = transaction_chunk.instance_id,
+                        chain = self.chain_id,
+                        from = "WaitingForMessages",
+                        to = "WaitingForDecided",
+                        side = "receiver",
+                    );
                     self.state.write().await.inflight_chunks.insert(
                         transaction_chunk.instance_id.clone(),
                         transaction_chunk.clone(),
@@ -763,6 +1046,12 @@ impl DefaultCoordinator {
                     return;
                 }
             } else {
+                xtflow!(
+                    "process_reject",
+                    instance_id = transaction_chunk.instance_id,
+                    chain = self.chain_id,
+                    reason = "chunk_missing_is_sender",
+                );
                 warn!("Transaction chunk not registered properly, rejecting");
                 let _ = self
                     .send_vote(transaction_chunk.instance_id.as_str(), false)
@@ -798,6 +1087,12 @@ impl DefaultCoordinator {
             return;
         };
 
+        xtflow!(
+            "decision_raced_ahead",
+            instance_id = transaction_chunk.instance_id,
+            chain = self.chain_id,
+            decision = decision,
+        );
         transaction_chunk.stage = if decision { Confirmed } else { Aborted };
         {
             let mut state = self.state.write().await;
@@ -817,6 +1112,13 @@ impl DefaultCoordinator {
     /// Finalize a decided-commit XT: `sendConfirm` on the sender side,
     /// `recvConfirmToken`/`recvConfirmETH` on the receiver side.
     pub async fn confirm_xt(&self, transaction_chunk: &mut TransactionChunk) {
+        xtflow!(
+            "confirm_begin",
+            instance_id = transaction_chunk.instance_id,
+            chain = self.chain_id,
+            is_sender = format!("{:?}", transaction_chunk.is_sender),
+            confirmed_stage = format!("{:?}", transaction_chunk.confirmed_stage),
+        );
         match transaction_chunk.is_sender {
             Some(true) => {
                 let Some(bridge_tx_bytes) = transaction_chunk.organised_transactions.get("bridge")
@@ -855,10 +1157,27 @@ impl DefaultCoordinator {
                     .submit_send_confirm(transaction_chunk.instance_id.as_str(), &header)
                     .await
                 {
+                    xtflow!(
+                        "confirm_err",
+                        instance_id = transaction_chunk.instance_id,
+                        chain = self.chain_id,
+                        side = "sender",
+                        call = "sendConfirm",
+                        error = e,
+                    );
                     warn!(transaction_chunk.instance_id, error = %e, "Failed to submit sendConfirm");
+                    self.note_finalize_failure(transaction_chunk, "sendConfirm").await;
                     return;
                 }
 
+                xtflow!(
+                    "confirm_ok",
+                    instance_id = transaction_chunk.instance_id,
+                    chain = self.chain_id,
+                    side = "sender",
+                    call = "sendConfirm",
+                    session = header.session_id,
+                );
                 self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Confirmed)
                     .await;
             }
@@ -898,10 +1217,27 @@ impl DefaultCoordinator {
                 };
 
                 if let Err(e) = result {
+                    xtflow!(
+                        "confirm_err",
+                        instance_id = transaction_chunk.instance_id,
+                        chain = self.chain_id,
+                        side = "receiver",
+                        call = "recvConfirm",
+                        error = e,
+                    );
                     warn!(transaction_chunk.instance_id, error = %e, "Failed to submit recvConfirm");
+                    self.note_finalize_failure(transaction_chunk, "recvConfirm").await;
                     return;
                 }
 
+                xtflow!(
+                    "confirm_ok",
+                    instance_id = transaction_chunk.instance_id,
+                    chain = self.chain_id,
+                    side = "receiver",
+                    call = "recvConfirm",
+                    session = header.session_id,
+                );
                 self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Confirmed)
                     .await;
             }
@@ -917,38 +1253,45 @@ impl DefaultCoordinator {
     /// Compensate a decided-abort XT: `sendAbortToken`/`sendAbortETH` on the
     /// sender side, `recvAbortToken`/`recvAbortETH` on the receiver side.
     pub async fn abort_xt(&self, transaction_chunk: &mut TransactionChunk) {
+        xtflow!(
+            "abort_begin",
+            instance_id = transaction_chunk.instance_id,
+            chain = self.chain_id,
+            is_sender = format!("{:?}", transaction_chunk.is_sender),
+            confirmed_stage = format!("{:?}", transaction_chunk.confirmed_stage),
+        );
         match transaction_chunk.is_sender {
             Some(true) => {
-                match transaction_chunk.confirmed_stage {
-                    Some(stage) => match stage {
-                        Registered => {
-                            if self.send_abort_submit(transaction_chunk, None).await {
-                                return;
-                            }
+                let outcome = match transaction_chunk.confirmed_stage {
+                    Some(Registered) => self.send_abort_submit(transaction_chunk, None).await,
+                    Some(WaitingForMessages) => {
+                        let ack_dependency = self
+                            .lookup_mailbox_dependency(
+                                transaction_chunk.instance_id.as_str(),
+                                "ACK",
+                            )
+                            .await;
+                        if ack_dependency.is_none() {
+                            warn!(
+                                transaction_chunk.instance_id,
+                                "No ACK mailbox message found to removeInbox on abort"
+                            );
                         }
-                        WaitingForMessages => {
-                            let ack_dependency = self
-                                .lookup_mailbox_dependency(
-                                    transaction_chunk.instance_id.as_str(),
-                                    "ACK",
-                                )
-                                .await;
-                            if ack_dependency.is_none() {
-                                warn!(
-                                    transaction_chunk.instance_id,
-                                    "No ACK mailbox message found to removeInbox on abort"
-                                );
-                            }
-                            if self
-                                .send_abort_submit(transaction_chunk, ack_dependency.as_ref())
-                                .await
-                            {
-                                return;
-                            }
-                        }
-                        _ => {}
-                    },
-                    None => {}
+                        self.send_abort_submit(transaction_chunk, ack_dependency.as_ref())
+                            .await
+                    }
+                    // Nothing of this instance reached the builder, so there is
+                    // no escrow to refund.
+                    _ => Compensation::NotApplicable,
+                };
+
+                // Only mark the chunk done once the compensation is actually on
+                // its way. A failure here means the user's tokens are escrowed
+                // with no refund in flight, so leave `confirmed_stage` behind
+                // and let the watchdog retry.
+                if let Compensation::Failed = outcome {
+                    self.note_finalize_failure(transaction_chunk, "sendAbort").await;
+                    return;
                 }
 
                 // The chunk only reaches Aborted from WaitingForDecided, which
@@ -1036,7 +1379,27 @@ impl DefaultCoordinator {
                                 };
 
                                 if let Err(e) = result {
+                                    xtflow!(
+                                        "abort_err",
+                                        instance_id = transaction_chunk.instance_id,
+                                        chain = self.chain_id,
+                                        side = "receiver",
+                                        call = "recvAbort",
+                                        error = e,
+                                    );
                                     warn!(transaction_chunk.instance_id, error = %e, "Failed to submit recvAbort");
+                                    self.note_finalize_failure(transaction_chunk, "recvAbort")
+                                        .await;
+                                    return;
+                                } else {
+                                    xtflow!(
+                                        "abort_ok",
+                                        instance_id = transaction_chunk.instance_id,
+                                        chain = self.chain_id,
+                                        side = "receiver",
+                                        call = "recvAbort",
+                                        remove_inbox = send_dependency.is_some(),
+                                    );
                                 }
                             }
                             _ => {}
@@ -1061,26 +1424,26 @@ impl DefaultCoordinator {
         &self,
         transaction_chunk: &mut TransactionChunk,
         remove_inbox_dependency: Option<&CrossRollupDependency>,
-    ) -> bool {
+    ) -> Compensation {
         let Some(bridge_tx_bytes) = transaction_chunk.organised_transactions.get("bridge") else {
             warn!(
                 transaction_chunk.instance_id,
                 "No bridge tx recorded for sender abort, dropping"
             );
-            return true;
+            return Compensation::NotApplicable;
         };
         let Some((sender, _nonce)) = decode_sender_nonce(bridge_tx_bytes) else {
             warn!(
                 transaction_chunk.instance_id,
                 "Failed to recover bridge tx signer for abort, dropping"
             );
-            return true;
+            return Compensation::NotApplicable;
         };
         let args = match Self::decode_bridge_call_args(bridge_tx_bytes) {
             Ok(args) => args,
             Err(e) => {
                 warn!(transaction_chunk.instance_id, error = %e, "Failed to decode bridge tx for abort, dropping");
-                return true;
+                return Compensation::NotApplicable;
             }
         };
 
@@ -1123,9 +1486,44 @@ impl DefaultCoordinator {
         };
 
         if let Err(e) = result {
+            xtflow!(
+                "abort_err",
+                instance_id = transaction_chunk.instance_id,
+                chain = self.chain_id,
+                side = "sender",
+                call = "sendAbort",
+                error = e,
+            );
             warn!(transaction_chunk.instance_id, error = %e, "Failed to submit sendAbort");
+            return Compensation::Failed;
         }
-        false
+
+        xtflow!(
+            "abort_ok",
+            instance_id = transaction_chunk.instance_id,
+            chain = self.chain_id,
+            side = "sender",
+            call = "sendAbort",
+            remove_inbox = remove_inbox_dependency.is_some(),
+        );
+        Compensation::Submitted
+    }
+
+    /// Count a failed finalize/compensate attempt and leave the chunk short of
+    /// `confirmed_stage`, so `retry_unfinished_finalizations` picks it up on
+    /// the next watchdog tick.
+    async fn note_finalize_failure(&self, transaction_chunk: &TransactionChunk, call: &str) {
+        let attempts = self
+            .record_finalize_failure(transaction_chunk.instance_id.as_str())
+            .await;
+        xtflow!(
+            "finalize_failed",
+            instance_id = transaction_chunk.instance_id,
+            chain = self.chain_id,
+            call = call,
+            attempts = attempts,
+            max_attempts = crate::coordinator::MAX_FINALIZE_ATTEMPTS,
+        );
     }
 
     fn receive_call_kind(tx_bytes: &[u8]) -> Option<ReceiveCallKind> {
@@ -1148,15 +1546,23 @@ impl DefaultCoordinator {
     /// `on_decision` already set it to the target `Confirmed`/`Aborted`
     /// value). Takes the write lock only for this single field update.
     async fn mark_confirmed_stage(&self, instance_id: &str, stage: ChunkStage) {
-        if let Some(chunk) = self
+        let marked = self
             .state
             .write()
             .await
             .inflight_chunks
             .get_mut(instance_id)
-        {
-            chunk.confirmed_stage = Some(stage);
-        }
+            .map(|chunk| {
+                chunk.confirmed_stage = Some(stage);
+            })
+            .is_some();
+        xtflow!(
+            "terminal",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            confirmed_stage = format!("{stage:?}"),
+            chunk_present = marked,
+        );
     }
 
     /// Look up a recorded mailbox message for `instance_id` with the given
@@ -1502,11 +1908,26 @@ impl DefaultCoordinator {
         let instance_bytes = {
             let mut state = self.state.write().await;
             let Some(xt) = state.pending.get_mut(instance_id) else {
+                xtflow!(
+                    "vote_skipped",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    vote = vote,
+                    reason = "xt_not_pending",
+                );
                 return Ok(());
             };
 
             // First local vote wins for the instance.
             if xt.local_vote.is_some() {
+                xtflow!(
+                    "vote_skipped",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    vote = vote,
+                    reason = "duplicate_local_vote",
+                    existing = format!("{:?}", xt.local_vote),
+                );
                 debug!(
                     instance_id,
                     existing_vote = ?xt.local_vote,
@@ -1568,15 +1989,45 @@ impl DefaultCoordinator {
         if !standalone_mode {
             if let Some(publisher) = &self.publisher {
                 if let Err(e) = publisher.send_vote(&instance_bytes, vote).await {
+                    xtflow!(
+                        "vote_err",
+                        instance_id = instance_id,
+                        chain = self.chain_id,
+                        vote = vote,
+                        to = "publisher",
+                        error = e,
+                    );
                     error!(instance_id, error = %e, "Failed to send vote to publisher");
                     if let Some(m) = &self.metrics {
                         m.vote_send_failed_total.inc();
                     }
                 } else {
+                    xtflow!(
+                        "vote",
+                        instance_id = instance_id,
+                        chain = self.chain_id,
+                        vote = vote,
+                        to = "publisher",
+                    );
                     info!(instance_id, vote, "Vote sent to publisher");
                 }
+            } else {
+                xtflow!(
+                    "vote_skipped",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    vote = vote,
+                    reason = "no_publisher_client",
+                );
             }
         } else {
+            xtflow!(
+                "vote",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                vote = vote,
+                to = "peers",
+            );
             info!(
                 instance_id,
                 vote,

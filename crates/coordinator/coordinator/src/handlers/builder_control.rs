@@ -9,7 +9,7 @@ use alloy::consensus::{Transaction, TxEnvelope};
 use alloy::rlp::Decodable;
 use alloy::sol_types::SolCall;
 use compose_mailbox::contract::writeMessageCall;
-use compose_primitives::{ChainId, CrossRollupDependency};
+use compose_primitives::{xtflow, ChainId, CrossRollupDependency};
 use compose_primitives_traits::CoordinatorError;
 use tracing::{error, info, warn};
 
@@ -102,27 +102,54 @@ impl DefaultCoordinator {
         &self,
         instance_id: &str,
         transactions: Vec<Vec<u8>>,
+        reserved: Option<(u64, usize)>,
     ) -> Result<(), CoordinatorError> {
         let Some(builder) = &self.xt_builder_client else {
             return Ok(());
         };
 
+        xtflow!(
+            "builder_release",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            call = "ethera_releaseXt",
+            tx_count = transactions.len(),
+            txs = crate::pipeline::delivery::describe_local_txs(self.chain_id, &transactions),
+        );
         if let Err(err) = builder.release_xt(instance_id, transactions).await {
-            if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+            xtflow!(
+                "builder_release_err",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                call = "ethera_releaseXt",
+                error = err,
+            );
+            if let (true, Some((start, count))) = (err.is_builder_rejection(), reserved) {
+                self.recycle_nonce(start, count, "release_rejected").await;
+            }
+            if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
                 warn!(error = %resync_err, "Failed to resync putInbox nonce after release error");
             }
             return Err(err);
         }
+        xtflow!(
+            "builder_release_ok",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            call = "ethera_releaseXt",
+        );
 
         Ok(())
     }
 
+    /// Build one `putInbox` per dependency on a contiguous nonce range,
+    /// returning the transactions and the first nonce of the range.
     async fn build_put_inbox_transactions(
         &self,
         dependencies: &[CrossRollupDependency],
-    ) -> Result<Vec<Vec<u8>>, CoordinatorError> {
+    ) -> Result<(Vec<Vec<u8>>, u64), CoordinatorError> {
         if dependencies.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         let builder = self
@@ -162,19 +189,29 @@ impl DefaultCoordinator {
                             .observe(build_started.elapsed().as_secs_f64());
                         metrics.put_inbox_build_error_total.inc();
                     }
+                    // None of the range was submitted, so give all of it back.
+                    self.recycle_nonce(
+                        start_nonce,
+                        dependencies.len(),
+                        "put_inbox_batch_build_failed",
+                    )
+                    .await;
                     return Err(error);
                 }
             }
             nonce = nonce.saturating_add(1);
         }
 
-        Ok(transactions)
+        Ok((transactions, start_nonce))
     }
 
-    pub(crate) async fn build_put_inbox_transaction(
+    /// Build a single `putInbox` transaction, returning it together with the
+    /// nonce it consumed so the caller can hand that nonce back if the
+    /// transaction never makes it into the builder's pool.
+    pub(crate) async fn build_put_inbox_transaction_with_nonce(
         &self,
         dependency: &CrossRollupDependency,
-    ) -> Result<Vec<u8>, CoordinatorError> {
+    ) -> Result<(Vec<u8>, u64), CoordinatorError> {
         let builder = self
             .put_inbox_builder
             .as_ref()
@@ -200,7 +237,7 @@ impl DefaultCoordinator {
                         .put_inbox_build_duration_seconds
                         .observe(build_started.elapsed().as_secs_f64());
                 }
-                Ok(transaction)
+                Ok((transaction, nonce))
             }
             Err(error) => {
                 if let Some(metrics) = &self.metrics {
@@ -209,9 +246,25 @@ impl DefaultCoordinator {
                         .observe(build_started.elapsed().as_secs_f64());
                     metrics.put_inbox_build_error_total.inc();
                 }
+                // Nothing was signed, so nothing can have reached the builder.
+                self.recycle_nonce(nonce, 1, "put_inbox_build_failed").await;
                 Err(error)
             }
         }
+    }
+
+    /// Hand a reserved nonce back to the manager and record it, so a dropped
+    /// coordinator transaction does not leave a permanent hole in the shared
+    /// nonce sequence.
+    pub(crate) async fn recycle_nonce(&self, start: u64, count: usize, reason: &str) {
+        self.nonce_manager.release(start, count).await;
+        xtflow!(
+            "nonce_recycled",
+            chain = self.chain_id,
+            nonce = start,
+            count = count,
+            reason = reason,
+        );
     }
 
     /// Decodes `tx_bytes` as a signed `writeMessage(Message)` transaction, derives the
@@ -245,10 +298,13 @@ impl DefaultCoordinator {
         instance_id: &str,
         dependency: CrossRollupDependency,
     ) -> Result<(), CoordinatorError> {
-        let transaction = match self.build_put_inbox_transaction(&dependency).await {
-            Ok(transaction) => transaction,
+        let (transaction, nonce) = match self
+            .build_put_inbox_transaction_with_nonce(&dependency)
+            .await
+        {
+            Ok(built) => built,
             Err(error) => {
-                if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
                     warn!(error = %resync_err, "Failed to resync putInbox nonce after build error");
                 }
                 return Err(error);
@@ -256,20 +312,44 @@ impl DefaultCoordinator {
         };
 
         let Some(builder) = &self.xt_builder_client else {
+            self.recycle_nonce(nonce, 1, "no_builder_client").await;
             return Err(CoordinatorError::Other(
                 "xt builder client not configured".to_string(),
             ));
         };
 
+        xtflow!(
+            "builder_followup",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            call = "ethera_submitFollowup",
+            txs = crate::pipeline::delivery::describe_tx(self.chain_id, &transaction),
+        );
         if let Err(err) = builder
             .submit_followup_xt(instance_id, vec![transaction])
             .await
         {
-            if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+            xtflow!(
+                "builder_followup_err",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                call = "ethera_submitFollowup",
+                error = err,
+            );
+            if err.is_builder_rejection() {
+                self.recycle_nonce(nonce, 1, "followup_rejected").await;
+            }
+            if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
                 warn!(error = %resync_err, "Failed to resync putInbox nonce after submit error");
             }
             return Err(err);
         }
+        xtflow!(
+            "builder_followup_ok",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            call = "ethera_submitFollowup",
+        );
 
         Ok(())
     }
@@ -343,7 +423,9 @@ impl DefaultCoordinator {
         let tx = match build(l2_builder, start_nonce).await {
             Ok(tx) => tx,
             Err(error) => {
-                if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                self.recycle_nonce(start_nonce, nonce_count, "l2_bridge_build_failed")
+                    .await;
+                if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
                     warn!(error = %resync_err, "Failed to resync coordinator nonce after l2 bridge build error");
                 }
                 return Err(error);
@@ -352,18 +434,20 @@ impl DefaultCoordinator {
         let mut transactions = vec![tx];
 
         if let Some(dependency) = remove_inbox_dependency {
-            let put_inbox_builder = self
-                .put_inbox_builder
-                .as_ref()
-                .cloned()
-                .ok_or(CoordinatorError::PutInboxNotConfigured)?;
+            let Some(put_inbox_builder) = self.put_inbox_builder.as_ref().cloned() else {
+                self.recycle_nonce(start_nonce, nonce_count, "put_inbox_not_configured")
+                    .await;
+                return Err(CoordinatorError::PutInboxNotConfigured);
+            };
             match put_inbox_builder
                 .build_remove_inbox_tx_with_nonce(dependency, start_nonce.saturating_add(1))
                 .await
             {
                 Ok(tx) => transactions.push(tx),
                 Err(error) => {
-                    if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                    self.recycle_nonce(start_nonce, nonce_count, "remove_inbox_build_failed")
+                        .await;
+                    if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
                         warn!(error = %resync_err, "Failed to resync coordinator nonce after removeInbox build error");
                     }
                     return Err(error);
@@ -371,7 +455,8 @@ impl DefaultCoordinator {
             }
         }
 
-        self.release_to_builder(instance_id, transactions).await
+        self.release_to_builder(instance_id, transactions, Some((start_nonce, nonce_count)))
+            .await
     }
 
     /// Submit `sendConfirm(sendHeader)` — sender-side finalize once the ACK
@@ -502,19 +587,6 @@ impl DefaultCoordinator {
         .await
     }
 
-    pub(crate) async fn resync_put_inbox_nonce(&self) -> Result<(), CoordinatorError> {
-        let Some(builder) = self.put_inbox_builder.as_ref().cloned() else {
-            return Ok(());
-        };
-
-        self.nonce_manager
-            .resync(move || {
-                let builder = builder.clone();
-                async move { builder.canonical_nonce_at().await }
-            })
-            .await
-    }
-
     pub(crate) async fn resync_put_inbox_nonce_monotonic(&self) -> Result<(), CoordinatorError> {
         let Some(builder) = self.put_inbox_builder.as_ref().cloned() else {
             return Ok(());
@@ -541,13 +613,18 @@ impl DefaultCoordinator {
                 instance_id,
                 dependencies,
             } => {
-                let put_inbox_transactions =
+                let (put_inbox_transactions, start_nonce) =
                     self.build_put_inbox_transactions(&dependencies).await?;
+                let count = put_inbox_transactions.len();
                 if let Err(err) = builder
                     .release_xt(&instance_id, put_inbox_transactions)
                     .await
                 {
-                    if let Err(resync_err) = self.resync_put_inbox_nonce().await {
+                    if err.is_builder_rejection() && count > 0 {
+                        self.recycle_nonce(start_nonce, count, "release_rejected")
+                            .await;
+                    }
+                    if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
                         warn!(error = %resync_err, "Failed to resync putInbox nonce after release error");
                     }
                     return Err(err);
@@ -578,9 +655,21 @@ impl DefaultCoordinator {
             for instance_id in instance_ids {
                 if let Some(xt) = state.pending.get_mut(instance_id.as_str()) {
                     xt.confirmed_at = Some(now);
+                    xtflow!(
+                        "included",
+                        instance_id = instance_id,
+                        chain = self.chain_id,
+                        age_ms = xt.created_at.elapsed().as_millis(),
+                        decision = format!("{:?}", xt.decision),
+                    );
                     confirmed.push((xt.instance_id.clone(), instance_id.clone()));
                     info!(instance_id = %instance_id, "XT confirmed included by builder");
                 } else {
+                    xtflow!(
+                        "included_unknown",
+                        instance_id = instance_id,
+                        chain = self.chain_id,
+                    );
                     warn!(instance_id = %instance_id, "confirm received for unknown XT");
                 }
             }
@@ -776,24 +865,73 @@ mod tests {
 
         let dependencies = vec![test_dependency(), test_dependency()];
 
-        let transactions = coordinator
+        let (transactions, start_nonce) = coordinator
             .build_put_inbox_transactions(&dependencies)
             .await
             .unwrap();
 
+        assert_eq!(start_nonce, 7);
         assert_eq!(transactions.len(), 2);
         assert_eq!(transactions[0], 7_u64.to_be_bytes().to_vec());
         assert_eq!(transactions[1], 8_u64.to_be_bytes().to_vec());
 
+        // The chain moved on past the locally reserved range.
         builder.set_canonical_nonce(11).await;
-        coordinator.resync_put_inbox_nonce().await.unwrap();
+        coordinator
+            .resync_put_inbox_nonce_monotonic()
+            .await
+            .unwrap();
 
-        let transactions = coordinator
+        let (transactions, _) = coordinator
             .build_put_inbox_transactions(&[test_dependency()])
             .await
             .unwrap();
 
         assert_eq!(transactions, vec![11_u64.to_be_bytes().to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn recycled_nonce_is_reused_instead_of_leaving_a_hole() {
+        // The chain-A freeze in shape: a coordinator transaction reserves a
+        // nonce, its submission is rejected, and later transactions have
+        // already taken the nonces above it. Unless the rejected nonce is
+        // handed back, the builder's coordinator cursor stops there and every
+        // later cross-chain transaction on the chain is stuck behind it.
+        let mut coordinator = DefaultCoordinator::new(
+            ChainId(77777),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+            VerificationConfig::default(),
+        );
+        coordinator.set_put_inbox_builder(Arc::new(TestPutInboxBuilder::new(20)));
+
+        let (_, first) = coordinator
+            .build_put_inbox_transaction_with_nonce(&test_dependency())
+            .await
+            .unwrap();
+        let (_, second) = coordinator
+            .build_put_inbox_transaction_with_nonce(&test_dependency())
+            .await
+            .unwrap();
+        assert_eq!((first, second), (20, 21));
+
+        coordinator.recycle_nonce(first, 1, "test").await;
+
+        let (_, refilled) = coordinator
+            .build_put_inbox_transaction_with_nonce(&test_dependency())
+            .await
+            .unwrap();
+        assert_eq!(refilled, 20, "the hole must be refilled before extending");
+
+        let (_, next) = coordinator
+            .build_put_inbox_transaction_with_nonce(&test_dependency())
+            .await
+            .unwrap();
+        assert_eq!(next, 22);
     }
 
     #[tokio::test]
@@ -811,7 +949,7 @@ mod tests {
         let builder = Arc::new(TestPutInboxBuilder::new(7));
         coordinator.set_put_inbox_builder(builder.clone());
 
-        let transactions = coordinator
+        let (transactions, _) = coordinator
             .build_put_inbox_transactions(&[test_dependency(), test_dependency()])
             .await
             .unwrap();
@@ -824,7 +962,7 @@ mod tests {
             .await
             .unwrap();
 
-        let transactions = coordinator
+        let (transactions, _) = coordinator
             .build_put_inbox_transactions(&[test_dependency()])
             .await
             .unwrap();

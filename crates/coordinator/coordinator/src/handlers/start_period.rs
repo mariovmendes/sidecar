@@ -4,6 +4,7 @@ use compose_primitives::{PeriodId, SuperblockNumber};
 use tracing::{error, info};
 
 use crate::coordinator::DefaultCoordinator;
+use compose_primitives::xtflow;
 use compose_primitives_traits::CoordinatorError;
 
 impl DefaultCoordinator {
@@ -57,8 +58,31 @@ impl DefaultCoordinator {
             .await?;
         }
 
-        if let Err(e) = self.resync_put_inbox_nonce_monotonic().await {
-            error!(error = %e, "Failed to resync putInbox nonce on period change");
+        if builder_abort_ids.is_empty() {
+            if let Err(e) = self.resync_put_inbox_nonce_monotonic().await {
+                error!(error = %e, "Failed to resync putInbox nonce on period change");
+                self.nonce_manager.reset().await;
+            }
+        } else {
+            // `ethera_abortXt` drops the instance *and its reservations*, so
+            // the builder just handed back coordinator nonces that this
+            // sidecar already considers spent — including, in the worst case,
+            // one whose transaction it had already accepted. The monotonic
+            // resync cannot follow that downwards, and the recycling only
+            // covers nonces the builder explicitly rejected, so the two views
+            // would stay one apart forever and every later submission would be
+            // refused for a nonce gap. Drop the counter instead and let the
+            // next reservation re-read the builder's own expectation.
+            //
+            // ponytail: a reservation that is built but not yet submitted when
+            // this runs is invisible to the builder's pending count, so its
+            // nonce can be handed out twice; the duplicate is refused, recycled
+            // and retried. Track in-flight reservations if that shows up.
+            xtflow!(
+                "nonce_reset_after_abort",
+                chain = self.chain_id,
+                aborted_instances = builder_abort_ids.len(),
+            );
             self.nonce_manager.reset().await;
         }
 

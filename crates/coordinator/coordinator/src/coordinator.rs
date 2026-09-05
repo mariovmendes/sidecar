@@ -25,8 +25,9 @@ use crate::model::chain_overlay::ChainOverlay;
 use crate::model::pending_xt::PendingXt;
 use crate::model::xt_status::{determine_xt_status, XtStatusResponse};
 use crate::nonce_manager::DeferredNonceManager;
-use crate::pipeline::delivery::build_sender_nonce_cache;
+use crate::pipeline::delivery::{build_sender_nonce_cache, describe_txs};
 use crate::pipeline::submission::{build_xt_request, xt_request_fingerprint};
+use compose_primitives::xtflow;
 
 type PendingSubmissionResult = Result<InstanceId, String>;
 type PendingSubmissionSender = oneshot::Sender<PendingSubmissionResult>;
@@ -58,7 +59,21 @@ pub struct TransactionChunk {
     pub stage: ChunkStage,
     pub organised_transactions: HashMap<String, Vec<u8>>,
     pub is_sender: Option<bool>,
+    /// How many times finalization (`sendConfirm`/`recvConfirm`) or
+    /// compensation (`sendAbort`/`recvAbort`) has been attempted and failed.
+    ///
+    /// A failed compensation leaves the user's tokens escrowed on the sender
+    /// chain with nothing on the way to refund them, so the attempt must be
+    /// repeated rather than dropped. The watchdog re-dispatches chunks whose
+    /// `confirmed_stage` never caught up with `stage`, up to
+    /// [`MAX_FINALIZE_ATTEMPTS`].
+    pub finalize_attempts: u32,
 }
+
+/// Cap on automatic finalize/compensate retries before the instance is
+/// escalated. Reaching it means tokens may be stranded, so it is logged as
+/// `finalize_abandoned` rather than passing silently.
+pub const MAX_FINALIZE_ATTEMPTS: u32 = 10;
 
 /// Shared coordinator state protected by a `RwLock`.
 #[derive(Debug)]
@@ -259,12 +274,28 @@ impl DefaultCoordinator {
     }
 
     /// Start the coordinator's background tasks (cleanup loop, etc.).
+    ///
+    /// Requires the chunk sender to be attached first: the tasks below are
+    /// spawned from clones of `self`, and `chunk_sender` is a plain field, so
+    /// one attached afterwards would be invisible to them and the watchdog
+    /// could never re-dispatch a failed finalization.
     pub async fn start(&self) -> Result<(), CoordinatorError> {
+        if self.chunk_sender.is_none() {
+            return Err(CoordinatorError::ChunkSenderNotSet(
+                "set_chunk_sender must be called before start()".to_string(),
+            ));
+        }
+
         info!(chain_id = %self.chain_id, "Starting coordinator");
 
         let coord = self.clone();
         self.task_tracker.spawn(async move {
             coord.cleanup_loop().await;
+        });
+
+        let coord = self.clone();
+        self.task_tracker.spawn(async move {
+            coord.watchdog_loop().await;
         });
 
         Ok(())
@@ -331,6 +362,191 @@ impl DefaultCoordinator {
             interval.tick().await;
             self.cleanup(Duration::from_secs(300)).await;
         }
+    }
+
+    /// Periodic liveness dump. The sidecar has no timer of its own: the
+    /// consensus round is bounded by the publisher's SCP timeout
+    /// (`CONSENSUS_TIMEOUT`), which broadcasts `Decided(false)` and lands here
+    /// as an ordinary decision. Everything after that decision — the abort
+    /// compensation, the builder's inclusion callback — is unbounded, so an XT
+    /// that loses a mailbox message or a builder callback sits in
+    /// `inflight_chunks` indefinitely, and 100 such undecided XTs make
+    /// `MAX_PENDING_XTS` reject every new submission.
+    ///
+    /// This loop makes both visible: one `state_dump` line per tick plus one
+    /// `stuck` line per XT undecided or unconfirmed for longer than
+    /// `STUCK_AFTER`. An XT still stuck well past the publisher's timeout
+    /// means the `Decided` never arrived or never reached its chunk.
+    async fn watchdog_loop(&self) {
+        // Just over the publisher's default 20s CONSENSUS_TIMEOUT, so a
+        // normally-timing-out round doesn't show up as stuck.
+        const STUCK_AFTER: Duration = Duration::from_secs(25);
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            self.retry_unfinished_finalizations().await;
+            self.stuck_scan(STUCK_AFTER).await;
+        }
+    }
+
+    /// Re-dispatch chunks whose finalize/compensate step never completed.
+    ///
+    /// `confirm_xt`/`abort_xt` only record `confirmed_stage` once their
+    /// on-chain step has actually been submitted, so a chunk sitting at
+    /// `Confirmed`/`Aborted` with a lagging `confirmed_stage` is one whose
+    /// `sendConfirm`/`sendAbort` failed. Nothing else would ever wake it: the
+    /// publisher broadcasts each decision once. For an abort that means the
+    /// user's escrowed tokens are waiting on a refund that will never be
+    /// retried, which is exactly how the last stress run stranded 72 accounts.
+    async fn retry_unfinished_finalizations(&self) {
+        let pending: Vec<(String, ChunkStage, u32)> = {
+            let state = self.state.read().await;
+            state
+                .inflight_chunks
+                .values()
+                .filter(|chunk| {
+                    matches!(chunk.stage, ChunkStage::Confirmed | ChunkStage::Aborted)
+                        && chunk.confirmed_stage != Some(chunk.stage)
+                })
+                .map(|chunk| {
+                    (
+                        chunk.instance_id.clone(),
+                        chunk.stage,
+                        chunk.finalize_attempts,
+                    )
+                })
+                .collect()
+        };
+
+        for (instance_id, stage, attempts) in pending {
+            if attempts >= MAX_FINALIZE_ATTEMPTS {
+                xtflow!(
+                    "finalize_abandoned",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    stage = format!("{stage:?}"),
+                    attempts = attempts,
+                );
+                error!(
+                    instance_id,
+                    ?stage,
+                    attempts,
+                    "Giving up on finalization; escrowed funds may need manual compensation"
+                );
+                continue;
+            }
+
+            xtflow!(
+                "finalize_retry",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                stage = format!("{stage:?}"),
+                attempts = attempts,
+            );
+
+            let Some(sender) = self.chunk_sender.as_ref() else {
+                warn!(instance_id, "No chunk sender configured, cannot retry finalization");
+                continue;
+            };
+            if let Err(e) = sender.send(instance_id.clone()).await {
+                warn!(instance_id, error = %e, "Failed to enqueue finalization retry");
+            }
+        }
+    }
+
+    /// Record that a finalize/compensate attempt failed, so the watchdog can
+    /// bound how often it is retried.
+    pub(crate) async fn record_finalize_failure(&self, instance_id: &str) -> u32 {
+        let mut state = self.state.write().await;
+        match state.inflight_chunks.get_mut(instance_id) {
+            Some(chunk) => {
+                chunk.finalize_attempts = chunk.finalize_attempts.saturating_add(1);
+                chunk.finalize_attempts
+            }
+            None => 0,
+        }
+    }
+
+    async fn stuck_scan(&self, stuck_after: Duration) {
+        let state = self.state.read().await;
+        let mut undecided = 0usize;
+        let mut unconfirmed = 0usize;
+
+        for (id, xt) in &state.pending {
+            let decided = xt.decision.is_some();
+            if !decided {
+                undecided += 1;
+            }
+            if decided && xt.confirmed_at.is_none() {
+                unconfirmed += 1;
+            }
+
+            // Terminal and cheap to skip: decided + builder-confirmed.
+            if decided && xt.confirmed_at.is_some() {
+                continue;
+            }
+            let age = xt.created_at.elapsed();
+            if age < stuck_after {
+                continue;
+            }
+
+            let chunk = state.inflight_chunks.get(id.as_str());
+            xtflow!(
+                "stuck",
+                instance_id = id,
+                chain = self.chain_id,
+                age_ms = age.as_millis(),
+                chunk_stage = chunk
+                    .map(|c| format!("{:?}", c.stage))
+                    .unwrap_or_else(|| "no_chunk".to_string()),
+                confirmed_stage = chunk
+                    .map(|c| format!("{:?}", c.confirmed_stage))
+                    .unwrap_or_else(|| "-".to_string()),
+                is_sender = chunk
+                    .map(|c| format!("{:?}", c.is_sender))
+                    .unwrap_or_else(|| "-".to_string()),
+                decision = format!("{:?}", xt.decision),
+                local_vote = format!("{:?}", xt.local_vote),
+                peer_votes = xt.peer_votes.len(),
+                expected_votes = xt.raw_txs.len(),
+                mailbox_msgs = state
+                    .mailbox_messages
+                    .get(id.as_str())
+                    .map(Vec::len)
+                    .unwrap_or(0),
+                confirmed = xt.confirmed_at.is_some(),
+            );
+        }
+
+        let mut stages: HashMap<String, usize> = HashMap::new();
+        for chunk in state.inflight_chunks.values() {
+            *stages.entry(format!("{:?}", chunk.stage)).or_default() += 1;
+        }
+        let mut stages: Vec<String> = stages
+            .into_iter()
+            .map(|(stage, count)| format!("{stage}:{count}"))
+            .collect();
+        stages.sort();
+
+        xtflow!(
+            "state_dump",
+            chain = self.chain_id,
+            pending = state.pending.len(),
+            undecided = undecided,
+            max_pending = 100,
+            decided_unconfirmed = unconfirmed,
+            inflight_chunks = state.inflight_chunks.len(),
+            chunk_stages = if stages.is_empty() {
+                "-".to_string()
+            } else {
+                stages.join(",")
+            },
+            mailbox_instances = state.mailbox_messages.len(),
+            mailbox_buffer = state.mailbox_buffer.len(),
+            period = state.current_period_id.0,
+            last_seq = state.last_sequence_num.0,
+            recycled_nonces = self.nonce_manager.freed_count().await,
+        );
     }
 
     pub(crate) async fn resolve_pending_submission(
@@ -441,6 +657,12 @@ impl DefaultCoordinator {
         &self,
         txs: HashMap<ChainId, Vec<Vec<u8>>>,
     ) -> Result<String, CoordinatorError> {
+        xtflow!(
+            "submit_received",
+            chain = self.chain_id,
+            chains = txs.len(),
+            txs = describe_txs(&txs),
+        );
         if txs.is_empty() {
             return Err(CoordinatorError::NoTransactions);
         }
@@ -490,28 +712,80 @@ impl DefaultCoordinator {
 
             if let Err(e) = publisher.send_raw(&data).await {
                 let message = format!("failed to send XT to publisher: {e}");
+                xtflow!(
+                    "publisher_submit_failed",
+                    chain = self.chain_id,
+                    fingerprint = fingerprint,
+                    error = e,
+                );
                 self.resolve_pending_submission(&fingerprint, Err(message.clone()))
                     .await;
                 return Err(CoordinatorError::Other(message));
             }
+            xtflow!(
+                "publisher_submit",
+                chain = self.chain_id,
+                fingerprint = fingerprint,
+                txs = describe_txs(&txs),
+            );
+        } else {
+            xtflow!(
+                "publisher_submit_joined",
+                chain = self.chain_id,
+                fingerprint = fingerprint,
+            );
         }
 
         // Wait for the publisher to respond with StartInstance, which carries
-        // the canonical instance_id.
-        let instance_id = tokio::time::timeout(Duration::from_secs(10), rx)
-            .await
-            .map_err(|_| {
-                CoordinatorError::Other(
+        // the canonical instance_id. This 10s cap is the *only* timeout on the
+        // submission path: once an instance_id is assigned nothing else in the
+        // pipeline is time-bounded (see `stuck_scan` in the watchdog loop).
+        let waited = std::time::Instant::now();
+        let assigned = tokio::time::timeout(Duration::from_secs(10), rx).await;
+        let instance_id = match assigned {
+            Err(_) => {
+                xtflow!(
+                    "publisher_assign_timeout",
+                    chain = self.chain_id,
+                    fingerprint = fingerprint,
+                    waited_ms = waited.elapsed().as_millis(),
+                    timeout_ms = 10_000,
+                );
+                return Err(CoordinatorError::Other(
                     "timed out waiting for publisher to assign instance_id".to_string(),
-                )
-            })?
-            .map_err(|_| {
-                CoordinatorError::Other(
+                ));
+            }
+            Ok(Err(_)) => {
+                xtflow!(
+                    "publisher_assign_dropped",
+                    chain = self.chain_id,
+                    fingerprint = fingerprint,
+                    waited_ms = waited.elapsed().as_millis(),
+                );
+                return Err(CoordinatorError::Other(
                     "publisher submission resolution dropped unexpectedly".to_string(),
-                )
-            })?
-            .map_err(CoordinatorError::Other)?;
+                ));
+            }
+            Ok(Ok(Err(e))) => {
+                xtflow!(
+                    "publisher_assign_rejected",
+                    chain = self.chain_id,
+                    fingerprint = fingerprint,
+                    waited_ms = waited.elapsed().as_millis(),
+                    error = e,
+                );
+                return Err(CoordinatorError::Other(e));
+            }
+            Ok(Ok(Ok(id))) => id,
+        };
 
+        xtflow!(
+            "publisher_assigned",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            fingerprint = fingerprint,
+            waited_ms = waited.elapsed().as_millis(),
+        );
         info!(instance_id = %instance_id, "Submitted XT to publisher");
         Ok(instance_id.to_string())
     }
@@ -590,6 +864,11 @@ impl DefaultCoordinator {
             m.xt_received_total.inc();
             m.xt_pending_count.inc();
         }
+        xtflow!(
+            "registered_standalone",
+            instance_id = instance_id,
+            chain = self.chain_id,
+        );
         info!(instance_id = %instance_id, "Submitted XT locally (standalone mode)");
 
         // Start simulation immediately after local registration.
@@ -679,6 +958,110 @@ mod tests {
         fn is_connected(&self) -> bool {
             true
         }
+    }
+
+    fn chunk_at(instance_id: &str, stage: ChunkStage, confirmed: Option<ChunkStage>) -> TransactionChunk {
+        TransactionChunk {
+            instance_id: instance_id.to_string(),
+            stage,
+            confirmed_stage: confirmed,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn start_requires_the_chunk_sender_and_background_clones_keep_it() {
+        // `start()` spawns its loops from clones of `self`. Attaching the
+        // chunk sender afterwards leaves those clones holding `None`, which is
+        // how the finalization retry silently did nothing for a whole stress
+        // run — it logged every retry and enqueued none.
+        let mut coordinator = DefaultCoordinator::new(
+            ChainId(77777),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+            VerificationConfig::default(),
+        );
+
+        assert!(
+            coordinator.start().await.is_err(),
+            "start() must refuse to spawn background tasks without a chunk sender"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        coordinator.set_chunk_sender(tx);
+        coordinator.start().await.expect("start after wiring");
+
+        {
+            let mut state = coordinator.state.write().await;
+            state.inflight_chunks.insert(
+                "xt-clone".to_string(),
+                chunk_at("xt-clone", ChunkStage::Aborted, Some(ChunkStage::WaitingForMessages)),
+            );
+        }
+
+        // A clone taken the way `start()` takes one must still be able to enqueue.
+        coordinator
+            .clone()
+            .retry_unfinished_finalizations()
+            .await;
+        assert_eq!(rx.recv().await.unwrap(), "xt-clone");
+        // Not calling stop(): the cleanup and watchdog loops never return, so
+        // TaskTracker::wait would block forever. The runtime drops them.
+    }
+
+    #[tokio::test]
+    async fn unfinished_compensation_is_retried_and_eventually_abandoned() {
+        // A failed sendAbort leaves the chunk at Aborted with confirmed_stage
+        // behind. Nothing else ever wakes it — the publisher broadcasts each
+        // decision once — so the watchdog has to, or the user's escrowed
+        // tokens are never refunded.
+        let mut coordinator = DefaultCoordinator::new(
+            ChainId(77777),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+            VerificationConfig::default(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        coordinator.set_chunk_sender(tx);
+
+        {
+            let mut state = coordinator.state.write().await;
+            state.inflight_chunks.insert(
+                "xt-retry".to_string(),
+                chunk_at("xt-retry", ChunkStage::Aborted, Some(ChunkStage::WaitingForMessages)),
+            );
+            // A chunk that did finish must not be retried.
+            state.inflight_chunks.insert(
+                "xt-done".to_string(),
+                chunk_at("xt-done", ChunkStage::Confirmed, Some(ChunkStage::Confirmed)),
+            );
+        }
+
+        coordinator.retry_unfinished_finalizations().await;
+        assert_eq!(rx.recv().await.unwrap(), "xt-retry");
+        assert!(rx.try_recv().is_err(), "finished chunks must not be retried");
+
+        // Each failed attempt is counted, and retries stop at the cap.
+        for expected in 1..=MAX_FINALIZE_ATTEMPTS {
+            assert_eq!(
+                coordinator.record_finalize_failure("xt-retry").await,
+                expected
+            );
+        }
+
+        coordinator.retry_unfinished_finalizations().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "must stop retrying once the attempt cap is reached"
+        );
     }
 
     #[tokio::test]

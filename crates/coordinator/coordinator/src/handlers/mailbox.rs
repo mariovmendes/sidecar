@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 
 use crate::coordinator::ChunkStage::{WaitingForMessages, WaitingForProcessing};
 use crate::coordinator::DefaultCoordinator;
+use compose_primitives::xtflow;
 use compose_primitives_traits::CoordinatorError;
 
 impl DefaultCoordinator {
@@ -25,6 +26,15 @@ impl DefaultCoordinator {
         instance_id: String,
         dependency: CrossRollupDependency,
     ) -> Result<(), CoordinatorError> {
+        xtflow!(
+            "ack_in",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            source_chain = dependency.source_chain_id,
+            session = dependency.session_id,
+            label = String::from_utf8_lossy(&dependency.label),
+        );
+
         let mailbox_msg = MailboxMessage {
             instance_id: instance_id.clone().into_bytes(),
             source_chain: dependency.source_chain_id.0,
@@ -60,16 +70,37 @@ impl DefaultCoordinator {
         match (advanced, &self.chunk_sender) {
             (true, Some(sender)) => {
                 if let Err(e) = sender.send(instance_id.clone()).await {
+                    xtflow!("signal_failed", instance_id = instance_id, chain = self.chain_id, from = "ack_in", error = e);
                     warn!(instance_id, error = %e, "Failed to enqueue ack chunk for processing");
+                } else {
+                    xtflow!("signal_enqueued", instance_id = instance_id, chain = self.chain_id, from = "ack_in");
                 }
             }
             (true, None) => {
+                xtflow!("signal_failed", instance_id = instance_id, chain = self.chain_id, from = "ack_in", error = "no_chunk_sender");
                 warn!(
                     instance_id,
                     "No chunk sender configured, ack recorded but not scheduled for processing"
                 );
             }
             (false, _) => {
+                // The ACK is recorded but nothing is waiting on it: either the
+                // chunk has not reached WaitingForMessages yet (it will find
+                // the message itself) or it already moved past it — in the
+                // latter case nothing will ever re-dispatch this instance.
+                xtflow!(
+                    "ack_in_not_advanced",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    chunk_stage = self
+                        .state
+                        .read()
+                        .await
+                        .inflight_chunks
+                        .get(instance_id.as_str())
+                        .map(|c| format!("{:?}", c.stage))
+                        .unwrap_or_else(|| "no_chunk".to_string()),
+                );
                 warn!(instance_id, "No inflight chunk found for ack, dropping");
             }
         }
@@ -83,6 +114,16 @@ impl DefaultCoordinator {
         msg: &MailboxMessage,
     ) -> Result<(), CoordinatorError> {
         let instance_id = hex::encode(&msg.instance_id);
+
+        xtflow!(
+            "mailbox_in",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            source_chain = msg.source_chain,
+            dest_chain = msg.destination_chain,
+            label = msg.label,
+            payload_bytes = msg.payload.len(),
+        );
 
         debug!(
             instance_id,
@@ -131,16 +172,34 @@ impl DefaultCoordinator {
         match (advanced, &self.chunk_sender) {
             (true, Some(sender)) => {
                 if let Err(e) = sender.send(instance_id.clone()).await {
+                    xtflow!("signal_failed", instance_id = instance_id, chain = self.chain_id, from = "mailbox_in", error = e);
                     warn!(instance_id, error = %e, "Failed to enqueue chunk for processing");
+                } else {
+                    xtflow!("signal_enqueued", instance_id = instance_id, chain = self.chain_id, from = "mailbox_in");
                 }
             }
             (true, None) => {
+                xtflow!("signal_failed", instance_id = instance_id, chain = self.chain_id, from = "mailbox_in", error = "no_chunk_sender");
                 warn!(
                     instance_id,
                     "No chunk sender configured, message recorded but not scheduled for processing"
                 );
             }
             (false, _) => {
+                xtflow!(
+                    "mailbox_in_not_advanced",
+                    instance_id = instance_id,
+                    chain = self.chain_id,
+                    label = msg.label,
+                    chunk_stage = self
+                        .state
+                        .read()
+                        .await
+                        .inflight_chunks
+                        .get(instance_id.as_str())
+                        .map(|c| format!("{:?}", c.stage))
+                        .unwrap_or_else(|| "no_chunk".to_string()),
+                );
                 debug!(
                     instance_id,
                     "No inflight chunk waiting on this instance yet"

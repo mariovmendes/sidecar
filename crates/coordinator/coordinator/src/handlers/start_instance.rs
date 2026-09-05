@@ -8,8 +8,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::coordinator::DefaultCoordinator;
 use crate::model::pending_xt::PendingXt;
-use crate::pipeline::delivery::build_sender_nonce_cache;
+use crate::pipeline::delivery::{build_sender_nonce_cache, describe_txs};
 use crate::pipeline::submission::xt_request_fingerprint;
+use compose_primitives::xtflow;
 use compose_primitives_traits::CoordinatorError;
 
 /// Maximum number of pending XTs before new submissions are rejected.
@@ -66,6 +67,13 @@ impl DefaultCoordinator {
             .count();
         if undecided_count >= MAX_PENDING_XTS {
             let error = CoordinatorError::TooManyPendingInstances(MAX_PENDING_XTS).to_string();
+            xtflow!(
+                "backpressure",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                undecided = undecided_count,
+                max_pending = MAX_PENDING_XTS,
+            );
             drop(state);
             self.resolve_pending_submission(&fingerprint, Err(error))
                 .await;
@@ -163,6 +171,16 @@ impl DefaultCoordinator {
             }
         }
 
+        xtflow!(
+            "start_instance",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            period = msg.period_id,
+            seq = msg.sequence_number,
+            chains = state.pending[&instance_id].raw_txs.len(),
+            includes_local = includes_local,
+            txs = describe_txs(&state.pending[&instance_id].raw_txs),
+        );
         info!(
             instance_id = %instance_id,
             period_id = msg.period_id,
@@ -201,16 +219,27 @@ impl DefaultCoordinator {
         if includes_local {
             let id = instance_id.to_string();
             if let Err(e) = sender.send(id.clone()).await {
+                xtflow!("signal_failed", instance_id = id, chain = self.chain_id, error = e);
                 error!(error = %e, instance_id = %id, "Failed to enqueue new instance, skipping XT processing");
             } else {
+                xtflow!("signal_enqueued", instance_id = id, chain = self.chain_id, from = "start_instance");
                 info!(instance_id = %id, "New instance signalled to chunk processor");
             }
+        } else {
+            xtflow!("not_local", instance_id = instance_id, chain = self.chain_id);
         }
 
         Ok(())
     }
 
     async fn reject_start_instance(&self, instance_id: &str, msg: &StartInstance) {
+        xtflow!(
+            "start_instance_rejected",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            period = msg.period_id,
+            seq = msg.sequence_number,
+        );
         warn!(
             instance_id,
             period_id = msg.period_id,

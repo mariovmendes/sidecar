@@ -7,7 +7,8 @@ use tracing::{debug, info};
 
 use crate::coordinator::{DefaultCoordinator, TransactionChunk};
 use crate::model::pending_xt::PendingXt;
-use crate::pipeline::delivery::build_sender_nonce_cache;
+use crate::pipeline::delivery::{build_sender_nonce_cache, describe_txs};
+use compose_primitives::xtflow;
 use compose_primitives_traits::CoordinatorError;
 
 /// Maximum number of pending XTs before new submissions are rejected.
@@ -83,6 +84,15 @@ impl DefaultCoordinator {
             }
         }
 
+        xtflow!(
+            "forwarded_xt_in",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            origin_chain = origin_chain,
+            origin_seq = origin_seq.0,
+            has_local = has_local,
+            txs = describe_txs(&state.pending[instance_id].raw_txs),
+        );
         info!(
             xt_id = instance_id,
             chains = state.pending[instance_id].raw_txs.len(),

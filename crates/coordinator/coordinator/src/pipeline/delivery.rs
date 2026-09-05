@@ -31,6 +31,55 @@ pub fn build_sender_nonce_cache(
         .collect()
 }
 
+/// Compact one-line description of a raw signed transaction for `XTFLOW`
+/// logging: `<chain>/<sender>/<nonce>/<selector>/<hash>`. Never fails — an
+/// undecodable transaction is reported as `<chain>/undecodable`.
+pub fn describe_tx(chain_id: ChainId, raw_tx: &[u8]) -> String {
+    let Ok(signed) = <TxEnvelope as alloy::rlp::Decodable>::decode(&mut &raw_tx[..]) else {
+        return format!("{chain_id}/undecodable");
+    };
+    let sender = signed
+        .recover_signer()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unrecoverable".to_string());
+    let input = signed.input();
+    let selector = if input.len() >= 4 {
+        format!("0x{}", hex::encode(&input[..4]))
+    } else {
+        "0x".to_string()
+    };
+    format!(
+        "{chain_id}/{sender}/{}/{selector}/{}",
+        signed.nonce(),
+        signed.tx_hash()
+    )
+}
+
+/// Same as [`describe_tx`] for a list of raw transactions on one chain.
+pub fn describe_local_txs(chain_id: ChainId, txs: &[Vec<u8>]) -> String {
+    txs.iter()
+        .map(|raw| describe_tx(chain_id, raw))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Same as [`describe_tx`] for every transaction of an XT, joined by `,`.
+/// Chains are emitted in ascending order so two sidecars log the same string
+/// for the same XT.
+pub fn describe_txs(txs: &HashMap<ChainId, Vec<Vec<u8>>>) -> String {
+    let mut chains: Vec<&ChainId> = txs.keys().collect();
+    chains.sort();
+    chains
+        .into_iter()
+        .flat_map(|chain_id| {
+            txs[chain_id]
+                .iter()
+                .map(move |raw| describe_tx(*chain_id, raw))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Filter dependencies to only those targeting the given chain.
 pub fn deps_for_chain(
     deps: &[CrossRollupDependency],

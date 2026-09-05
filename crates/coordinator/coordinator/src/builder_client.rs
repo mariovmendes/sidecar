@@ -108,11 +108,15 @@ impl HttpXtBuilderClient {
             .await
             .map_err(|err| CoordinatorError::BuilderControl(err.to_string()))?;
 
+        // A JSON-RPC error means the builder saw the request and refused it,
+        // as opposed to the transport failures above where the outcome is
+        // unknown. Callers use that distinction to decide whether the nonce
+        // the transaction reserved can be recycled.
         if let Some(error) = response.error {
-            return Err(CoordinatorError::BuilderControl(format!(
-                "{method} failed with code {}: {}",
-                error.code, error.message
-            )));
+            return Err(CoordinatorError::BuilderRejected {
+                method: method.to_string(),
+                message: format!("code {}: {}", error.code, error.message),
+            });
         }
 
         Ok(())

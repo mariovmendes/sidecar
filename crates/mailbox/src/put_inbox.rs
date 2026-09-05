@@ -80,10 +80,20 @@ impl PutInboxBuilder for PutInboxTxBuilder {
         self.signer_address
     }
 
+    /// The nonce the *builder* will accept next, not the one the chain is at.
+    ///
+    /// op-rbuilder's `eth_getTransactionCount(addr, "pending")` returns its
+    /// `true_next_nonce` — on-chain, plus its mempool, plus the XT pool's
+    /// reservations — which is exactly the value `validate_nonce_sequence`
+    /// compares a submission against. Asking for `latest` instead desyncs the
+    /// two views: when `ethera_abortXt` retracts an instance the builder gives
+    /// its reserved coordinator nonces back, and a sidecar reconciling against
+    /// the chain can neither see that nor move down to it, so every later
+    /// submission is refused for a nonce gap.
     async fn canonical_nonce_at(&self) -> Result<u64, CoordinatorError> {
         self.provider
             .get_transaction_count(self.signer_address)
-            .block_id(BlockId::latest())
+            .block_id(BlockId::pending())
             .await
             .map_err(|e| CoordinatorError::Nonce(format!("get canonical nonce: {e}")))
     }

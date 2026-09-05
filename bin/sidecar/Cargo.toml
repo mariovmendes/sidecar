@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 compose-config.workspace = true
+compose-primitives.workspace = true
 compose-transport.workspace = true
 compose-peer.workspace = true
 compose-mailbox.workspace = true

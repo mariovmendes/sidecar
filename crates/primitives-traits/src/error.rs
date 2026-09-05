@@ -55,8 +55,17 @@ pub enum CoordinatorError {
     #[error("put inbox builder not configured")]
     PutInboxNotConfigured,
 
+    /// Transport-level failure talking to the builder: timeout, connection
+    /// error, malformed response. The transaction may or may not have been
+    /// accepted, so its nonce must be treated as consumed.
     #[error("builder control error: {0}")]
     BuilderControl(String),
+
+    /// The builder answered with a JSON-RPC error, so the transaction was
+    /// definitely *not* accepted into its pool and the nonce it reserved can
+    /// safely be recycled.
+    #[error("builder rejected {method}: {message}")]
+    BuilderRejected { method: String, message: String },
 
     #[error("timeout waiting for CIRC from chain {0}")]
     CircTimeout(u64),
@@ -66,4 +75,12 @@ pub enum CoordinatorError {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl CoordinatorError {
+    /// Whether the builder definitively refused the transaction, so the nonce
+    /// it reserved was never used and can be handed out again.
+    pub fn is_builder_rejection(&self) -> bool {
+        matches!(self, Self::BuilderRejected { .. })
+    }
 }

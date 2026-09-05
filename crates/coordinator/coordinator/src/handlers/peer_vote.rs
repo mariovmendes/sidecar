@@ -4,6 +4,7 @@ use compose_primitives::ChainId;
 use tracing::info;
 
 use crate::coordinator::DefaultCoordinator;
+use compose_primitives::xtflow;
 use compose_primitives_traits::CoordinatorError;
 
 impl DefaultCoordinator {
@@ -44,6 +45,15 @@ impl DefaultCoordinator {
 
         xt.peer_votes.insert(chain_id, vote);
 
+        xtflow!(
+            "peer_vote_in",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            peer_chain = chain_id,
+            vote = vote,
+            peer_votes = xt.peer_votes.len(),
+            expected_votes = xt.raw_txs.len(),
+        );
         info!(
             instance_id,
             peer_chain = %chain_id,

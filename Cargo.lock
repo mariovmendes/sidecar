@@ -3878,6 +3878,7 @@ dependencies = [
  "compose-mailbox",
  "compose-metrics",
  "compose-peer",
+ "compose-primitives",
  "compose-publisher",
  "compose-server",
  "compose-simulation",
