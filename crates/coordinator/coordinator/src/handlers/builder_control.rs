@@ -124,11 +124,9 @@ impl DefaultCoordinator {
                 call = "ethera_releaseXt",
                 error = err,
             );
-            if let (true, Some((start, count))) = (err.is_builder_rejection(), reserved) {
-                self.recycle_nonce(start, count, "release_rejected").await;
-            }
-            if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
-                warn!(error = %resync_err, "Failed to resync putInbox nonce after release error");
+            if let Some((start, count)) = reserved {
+                self.reconcile_nonce_after_rejection(&err, start, count, "release_rejected")
+                    .await;
             }
             return Err(err);
         }
@@ -253,6 +251,42 @@ impl DefaultCoordinator {
         }
     }
 
+    /// Reconcile the coordinator nonce after the builder refused a submission.
+    ///
+    /// A nonce-gap rejection carries the builder's own expected value, and that
+    /// answer wins: snapping to it repairs the desync on the next attempt no
+    /// matter how it arose. Recycling the refused nonce instead would re-offer
+    /// the same rejected value forever — the livelock that left 1,565 aborted
+    /// XTs uncompensated. Any other rejection means the transaction never
+    /// entered the pool, so its nonce is simply handed back.
+    pub(crate) async fn reconcile_nonce_after_rejection(
+        &self,
+        error: &CoordinatorError,
+        start: u64,
+        count: usize,
+        reason: &str,
+    ) {
+        if let Some(expected) = error.expected_nonce() {
+            self.nonce_manager.force_set(expected).await;
+            xtflow!(
+                "nonce_resync",
+                chain = self.chain_id,
+                offered = start,
+                expected = expected,
+                reason = reason,
+            );
+            return;
+        }
+
+        if error.is_builder_rejection() {
+            self.recycle_nonce(start, count, reason).await;
+        }
+
+        if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
+            warn!(error = %resync_err, "Failed to resync coordinator nonce after rejection");
+        }
+    }
+
     /// Hand a reserved nonce back to the manager and record it, so a dropped
     /// coordinator transaction does not leave a permanent hole in the shared
     /// nonce sequence.
@@ -336,12 +370,8 @@ impl DefaultCoordinator {
                 call = "ethera_submitFollowup",
                 error = err,
             );
-            if err.is_builder_rejection() {
-                self.recycle_nonce(nonce, 1, "followup_rejected").await;
-            }
-            if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
-                warn!(error = %resync_err, "Failed to resync putInbox nonce after submit error");
-            }
+            self.reconcile_nonce_after_rejection(&err, nonce, 1, "followup_rejected")
+                .await;
             return Err(err);
         }
         xtflow!(
@@ -620,12 +650,14 @@ impl DefaultCoordinator {
                     .release_xt(&instance_id, put_inbox_transactions)
                     .await
                 {
-                    if err.is_builder_rejection() && count > 0 {
-                        self.recycle_nonce(start_nonce, count, "release_rejected")
-                            .await;
-                    }
-                    if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
-                        warn!(error = %resync_err, "Failed to resync putInbox nonce after release error");
+                    if count > 0 {
+                        self.reconcile_nonce_after_rejection(
+                            &err,
+                            start_nonce,
+                            count,
+                            "release_rejected",
+                        )
+                        .await;
                     }
                     return Err(err);
                 }

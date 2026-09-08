@@ -75,6 +75,35 @@ pub struct TransactionChunk {
 /// `finalize_abandoned` rather than passing silently.
 pub const MAX_FINALIZE_ATTEMPTS: u32 = 10;
 
+/// Admission bound: how many XTs may be in flight (accepted, not yet decided)
+/// before new ones are refused.
+///
+/// Set deliberately high: at the rates measured so far this gate is not the
+/// binding constraint and is not meant to be. A 2-client / 20 tx-per-second
+/// run never reached it once (0 rejections, peak 149 undecided, chunk queue
+/// median 0) — the losses there came from coordinator nonce desyncs, not from
+/// backlog.
+///
+/// It still bounds memory, and it still stops the unbounded-queue collapse
+/// seen at ~50 XT/s, where residence time passed the publisher's 20 s
+/// `CONSENSUS_TIMEOUT` and 70% of a run died by timeout. Note that the signal
+/// it watches — XTs awaiting a decision — is itself capped by that timeout, so
+/// it under-reports a genuinely backlogged pipeline; the chunk queue depth
+/// (`dispatch_done ... queued=`) is the honest measure of how far behind the
+/// processor is.
+///
+/// ponytail: a plain constant, not config, and it watches the weaker of the
+/// two available signals. Gate on chunk queue depth, or wire this to
+/// `SidecarArgs`, if it ever needs to actually bite.
+pub const MAX_PENDING_XTS: usize = 10_000;
+
+/// How many failed finalizations the watchdog re-queues per tick.
+const FINALIZE_RETRIES_PER_TICK: usize = 50;
+
+/// How many stuck instances the watchdog names per tick. The rest are counted
+/// only: logging thousands of lines per tick is itself a stall.
+const STUCK_REPORT_LIMIT: usize = 20;
+
 /// Shared coordinator state protected by a `RwLock`.
 #[derive(Debug)]
 pub(crate) struct CoordinatorState {
@@ -399,43 +428,68 @@ impl DefaultCoordinator {
     /// user's escrowed tokens are waiting on a refund that will never be
     /// retried, which is exactly how the last stress run stranded 72 accounts.
     async fn retry_unfinished_finalizations(&self) {
-        let pending: Vec<(String, ChunkStage, u32)> = {
+        // One pass under the read lock, collecting a capped retry batch and a
+        // count of the ones that have exhausted their attempts. Re-queueing
+        // thousands of retries into the same serial processor starves the live
+        // traffic they compete with, and the leftovers are picked up on the
+        // next tick anyway.
+        let (retry, abandoned, abandoned_sample) = {
             let state = self.state.read().await;
-            state
-                .inflight_chunks
-                .values()
-                .filter(|chunk| {
-                    matches!(chunk.stage, ChunkStage::Confirmed | ChunkStage::Aborted)
-                        && chunk.confirmed_stage != Some(chunk.stage)
-                })
-                .map(|chunk| {
-                    (
+            let mut retry: Vec<(String, ChunkStage, u32)> = Vec::new();
+            let mut abandoned = 0usize;
+            let mut abandoned_sample: Vec<String> = Vec::new();
+
+            for chunk in state.inflight_chunks.values() {
+                if !matches!(chunk.stage, ChunkStage::Confirmed | ChunkStage::Aborted)
+                    || chunk.confirmed_stage == Some(chunk.stage)
+                {
+                    continue;
+                }
+                if chunk.finalize_attempts >= MAX_FINALIZE_ATTEMPTS {
+                    abandoned += 1;
+                    if abandoned_sample.len() < STUCK_REPORT_LIMIT {
+                        abandoned_sample.push(chunk.instance_id.clone());
+                    }
+                    continue;
+                }
+                if retry.len() < FINALIZE_RETRIES_PER_TICK {
+                    retry.push((
                         chunk.instance_id.clone(),
                         chunk.stage,
                         chunk.finalize_attempts,
-                    )
-                })
-                .collect()
-        };
-
-        for (instance_id, stage, attempts) in pending {
-            if attempts >= MAX_FINALIZE_ATTEMPTS {
-                xtflow!(
-                    "finalize_abandoned",
-                    instance_id = instance_id,
-                    chain = self.chain_id,
-                    stage = format!("{stage:?}"),
-                    attempts = attempts,
-                );
-                error!(
-                    instance_id,
-                    ?stage,
-                    attempts,
-                    "Giving up on finalization; escrowed funds may need manual compensation"
-                );
-                continue;
+                    ));
+                }
             }
 
+            (retry, abandoned, abandoned_sample)
+        };
+
+        // Escalated once per tick as a summary rather than per instance: each
+        // one may have left escrowed funds needing manual compensation.
+        if abandoned > 0 {
+            xtflow!(
+                "finalize_abandoned",
+                chain = self.chain_id,
+                count = abandoned,
+                instances = abandoned_sample.join(","),
+            );
+            error!(
+                abandoned,
+                "Gave up on finalization; escrowed funds may need manual compensation"
+            );
+        }
+
+        let Some(sender) = self.chunk_sender.as_ref() else {
+            if !retry.is_empty() {
+                warn!(
+                    count = retry.len(),
+                    "No chunk sender configured, cannot retry finalizations"
+                );
+            }
+            return;
+        };
+
+        for (instance_id, stage, attempts) in retry {
             xtflow!(
                 "finalize_retry",
                 instance_id = instance_id,
@@ -443,15 +497,22 @@ impl DefaultCoordinator {
                 stage = format!("{stage:?}"),
                 attempts = attempts,
             );
-
-            let Some(sender) = self.chunk_sender.as_ref() else {
-                warn!(instance_id, "No chunk sender configured, cannot retry finalization");
-                continue;
-            };
             if let Err(e) = sender.send(instance_id.clone()).await {
                 warn!(instance_id, error = %e, "Failed to enqueue finalization retry");
             }
         }
+    }
+
+    /// XTs accepted but not yet decided. This is the queue depth that matters:
+    /// each one must reach a decision before the publisher's SCP timeout.
+    pub(crate) async fn inflight_xt_count(&self) -> usize {
+        self.state
+            .read()
+            .await
+            .pending
+            .values()
+            .filter(|xt| xt.decision.is_none())
+            .count()
     }
 
     /// Record that a finalize/compensate attempt failed, so the watchdog can
@@ -467,84 +528,144 @@ impl DefaultCoordinator {
         }
     }
 
+    /// Report the oldest stuck instances and a one-line summary.
+    ///
+    /// Everything is collected under the read lock and formatted *after* it is
+    /// released, and only [`STUCK_REPORT_LIMIT`] instances are named. The
+    /// earlier version logged one line per stuck XT while holding the lock —
+    /// 4,350 formatted lines per tick under overload — which stalled every
+    /// state mutation in the pipeline for the duration, every 10 seconds.
     async fn stuck_scan(&self, stuck_after: Duration) {
-        let state = self.state.read().await;
-        let mut undecided = 0usize;
-        let mut unconfirmed = 0usize;
+        struct StuckXt {
+            instance_id: String,
+            age_ms: u128,
+            chunk_stage: String,
+            confirmed_stage: String,
+            is_sender: String,
+            decision: String,
+            local_vote: String,
+            peer_votes: usize,
+            expected_votes: usize,
+            mailbox_msgs: usize,
+        }
 
-        for (id, xt) in &state.pending {
-            let decided = xt.decision.is_some();
-            if !decided {
-                undecided += 1;
-            }
-            if decided && xt.confirmed_at.is_none() {
-                unconfirmed += 1;
+        let (undecided, unconfirmed, stuck_total, worst, pending_len, chunk_len, stages, period, last_seq) = {
+            let state = self.state.read().await;
+            let mut undecided = 0usize;
+            let mut unconfirmed = 0usize;
+            let mut stuck_total = 0usize;
+            // Kept sorted-by-age via a bounded insert, so this stays O(pending)
+            // with a tiny constant instead of collecting every stuck instance.
+            let mut worst: Vec<StuckXt> = Vec::with_capacity(STUCK_REPORT_LIMIT + 1);
+
+            for (id, xt) in &state.pending {
+                let decided = xt.decision.is_some();
+                if !decided {
+                    undecided += 1;
+                }
+                if decided && xt.confirmed_at.is_some() {
+                    continue;
+                }
+                if decided {
+                    unconfirmed += 1;
+                }
+                let age = xt.created_at.elapsed();
+                if age < stuck_after {
+                    continue;
+                }
+                stuck_total += 1;
+
+                let age_ms = age.as_millis();
+                if worst.len() == STUCK_REPORT_LIMIT
+                    && worst.last().is_some_and(|w| w.age_ms >= age_ms)
+                {
+                    continue;
+                }
+                let chunk = state.inflight_chunks.get(id.as_str());
+                let entry = StuckXt {
+                    instance_id: id.to_string(),
+                    age_ms,
+                    chunk_stage: chunk
+                        .map(|c| format!("{:?}", c.stage))
+                        .unwrap_or_else(|| "no_chunk".to_string()),
+                    confirmed_stage: chunk
+                        .map(|c| format!("{:?}", c.confirmed_stage))
+                        .unwrap_or_else(|| "-".to_string()),
+                    is_sender: chunk
+                        .map(|c| format!("{:?}", c.is_sender))
+                        .unwrap_or_else(|| "-".to_string()),
+                    decision: format!("{:?}", xt.decision),
+                    local_vote: format!("{:?}", xt.local_vote),
+                    peer_votes: xt.peer_votes.len(),
+                    expected_votes: xt.raw_txs.len(),
+                    mailbox_msgs: state
+                        .mailbox_messages
+                        .get(id.as_str())
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                };
+                let at = worst.partition_point(|w| w.age_ms > age_ms);
+                worst.insert(at, entry);
+                worst.truncate(STUCK_REPORT_LIMIT);
             }
 
-            // Terminal and cheap to skip: decided + builder-confirmed.
-            if decided && xt.confirmed_at.is_some() {
-                continue;
+            let mut stages: HashMap<String, usize> = HashMap::new();
+            for chunk in state.inflight_chunks.values() {
+                *stages.entry(format!("{:?}", chunk.stage)).or_default() += 1;
             }
-            let age = xt.created_at.elapsed();
-            if age < stuck_after {
-                continue;
-            }
+            let mut stages: Vec<String> = stages
+                .into_iter()
+                .map(|(stage, count)| format!("{stage}:{count}"))
+                .collect();
+            stages.sort();
 
-            let chunk = state.inflight_chunks.get(id.as_str());
+            (
+                undecided,
+                unconfirmed,
+                stuck_total,
+                worst,
+                state.pending.len(),
+                state.inflight_chunks.len(),
+                stages,
+                state.current_period_id.0,
+                state.last_sequence_num.0,
+            )
+        }; // lock released before any formatting or I/O
+
+        for xt in &worst {
             xtflow!(
                 "stuck",
-                instance_id = id,
+                instance_id = xt.instance_id,
                 chain = self.chain_id,
-                age_ms = age.as_millis(),
-                chunk_stage = chunk
-                    .map(|c| format!("{:?}", c.stage))
-                    .unwrap_or_else(|| "no_chunk".to_string()),
-                confirmed_stage = chunk
-                    .map(|c| format!("{:?}", c.confirmed_stage))
-                    .unwrap_or_else(|| "-".to_string()),
-                is_sender = chunk
-                    .map(|c| format!("{:?}", c.is_sender))
-                    .unwrap_or_else(|| "-".to_string()),
-                decision = format!("{:?}", xt.decision),
-                local_vote = format!("{:?}", xt.local_vote),
-                peer_votes = xt.peer_votes.len(),
-                expected_votes = xt.raw_txs.len(),
-                mailbox_msgs = state
-                    .mailbox_messages
-                    .get(id.as_str())
-                    .map(Vec::len)
-                    .unwrap_or(0),
-                confirmed = xt.confirmed_at.is_some(),
+                age_ms = xt.age_ms,
+                chunk_stage = xt.chunk_stage,
+                confirmed_stage = xt.confirmed_stage,
+                is_sender = xt.is_sender,
+                decision = xt.decision,
+                local_vote = xt.local_vote,
+                peer_votes = xt.peer_votes,
+                expected_votes = xt.expected_votes,
+                mailbox_msgs = xt.mailbox_msgs,
             );
         }
-
-        let mut stages: HashMap<String, usize> = HashMap::new();
-        for chunk in state.inflight_chunks.values() {
-            *stages.entry(format!("{:?}", chunk.stage)).or_default() += 1;
-        }
-        let mut stages: Vec<String> = stages
-            .into_iter()
-            .map(|(stage, count)| format!("{stage}:{count}"))
-            .collect();
-        stages.sort();
 
         xtflow!(
             "state_dump",
             chain = self.chain_id,
-            pending = state.pending.len(),
+            pending = pending_len,
             undecided = undecided,
-            max_pending = 100,
+            max_inflight = MAX_PENDING_XTS,
+            stuck = stuck_total,
+            stuck_reported = worst.len(),
             decided_unconfirmed = unconfirmed,
-            inflight_chunks = state.inflight_chunks.len(),
+            inflight_chunks = chunk_len,
             chunk_stages = if stages.is_empty() {
                 "-".to_string()
             } else {
                 stages.join(",")
             },
-            mailbox_instances = state.mailbox_messages.len(),
-            mailbox_buffer = state.mailbox_buffer.len(),
-            period = state.current_period_id.0,
-            last_seq = state.last_sequence_num.0,
+            period = period,
+            last_seq = last_seq,
             recycled_nonces = self.nonce_manager.freed_count().await,
         );
     }
@@ -665,6 +786,22 @@ impl DefaultCoordinator {
         );
         if txs.is_empty() {
             return Err(CoordinatorError::NoTransactions);
+        }
+
+        // Shed load here, before the publisher assigns an instance and
+        // broadcasts it to every sidecar. Rejecting at this door costs one
+        // error response; rejecting later — or not at all — costs a publisher
+        // round trip, two registrations and an abort with compensation on both
+        // chains, all for an XT that cannot finish inside the SCP timeout.
+        let inflight = self.inflight_xt_count().await;
+        if inflight >= MAX_PENDING_XTS {
+            xtflow!(
+                "admission_rejected",
+                chain = self.chain_id,
+                inflight = inflight,
+                max_inflight = MAX_PENDING_XTS,
+            );
+            return Err(CoordinatorError::TooManyPendingInstances(MAX_PENDING_XTS));
         }
         if txs.len() < 2 {
             return Err(CoordinatorError::Other(
@@ -794,8 +931,6 @@ impl DefaultCoordinator {
         &self,
         txs: HashMap<ChainId, Vec<Vec<u8>>>,
     ) -> Result<String, CoordinatorError> {
-        const MAX_PENDING_XTS: usize = 100;
-
         // Compute fingerprint before acquiring the lock to detect duplicates.
         let xt_request = build_xt_request(&txs);
         let fingerprint = xt_request_fingerprint(&xt_request);
@@ -967,6 +1102,99 @@ mod tests {
             confirmed_stage: confirmed,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn submit_is_refused_once_the_inflight_bound_is_reached() {
+        // Load shedding at the front door: past `throughput x deadline` in
+        // flight, an accepted XT cannot reach a decision before the publisher
+        // times it out, so refusing it protects the ones that still can.
+        let coordinator = DefaultCoordinator::new(
+            ChainId(77777),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+            VerificationConfig::default(),
+        );
+
+        {
+            let mut state = coordinator.state.write().await;
+            for i in 0..MAX_PENDING_XTS {
+                let id = format!("xt-inflight-{i}");
+                let mut xt = PendingXt::new(id.clone(), id.as_bytes().to_vec());
+                xt.raw_txs.insert(ChainId(77777), vec![vec![1]]);
+                state.pending.insert(id.into(), xt); // decision: None => in flight
+            }
+            // A decided XT still sitting in `pending` must not count against
+            // the bound — it is waiting for cleanup, not for the pipeline.
+            let mut done = PendingXt::new("xt-done".to_string(), b"xt-done".to_vec());
+            done.record_decision(true);
+            state.pending.insert(done.id.clone(), done);
+        }
+
+        assert_eq!(coordinator.inflight_xt_count().await, MAX_PENDING_XTS);
+
+        let mut txs = HashMap::new();
+        txs.insert(ChainId(77777), vec![vec![1]]);
+        txs.insert(ChainId(88888), vec![vec![2]]);
+        let result = coordinator.submit_xt(txs.clone()).await;
+        assert!(
+            matches!(result, Err(CoordinatorError::TooManyPendingInstances(_))),
+            "expected admission rejection, got {result:?}"
+        );
+
+        // Once one decides, the door opens again.
+        {
+            let mut state = coordinator.state.write().await;
+            let id = InstanceId::from("xt-inflight-0");
+            state.pending.get_mut(&id).unwrap().record_decision(false);
+        }
+        assert_eq!(coordinator.inflight_xt_count().await, MAX_PENDING_XTS - 1);
+    }
+
+    #[tokio::test]
+    async fn stuck_scan_reports_the_oldest_and_only_a_bounded_number() {
+        // The watchdog used to emit one line per stuck XT while holding the
+        // state read lock — thousands per tick under overload, which stalled
+        // every state mutation behind it.
+        let coordinator = DefaultCoordinator::new(
+            ChainId(77777),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1000,
+            VerificationConfig::default(),
+        );
+
+        {
+            let mut state = coordinator.state.write().await;
+            for i in 0..(STUCK_REPORT_LIMIT * 5) {
+                let id = format!("xt-stuck-{i}");
+                let mut xt = PendingXt::new(id.clone(), id.as_bytes().to_vec());
+                xt.raw_txs.insert(ChainId(77777), vec![vec![1]]);
+                state.pending.insert(id.into(), xt);
+            }
+        }
+
+        // Everything is far older than the threshold, so the scan must still
+        // return promptly and without touching every entry twice.
+        let started = std::time::Instant::now();
+        coordinator.stuck_scan(Duration::ZERO).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "scan should stay cheap with many stuck instances"
+        );
+
+        // The lock must be free the moment the scan returns.
+        assert!(
+            coordinator.state.try_write().is_ok(),
+            "stuck_scan must not hold the state lock while logging"
+        );
     }
 
     #[tokio::test]

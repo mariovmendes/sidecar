@@ -994,17 +994,17 @@ impl DefaultCoordinator {
                             side = "receiver",
                             error = e,
                         );
-                        // The bundle carries the coordinator's putInbox: when
-                        // the builder refuses it outright, that nonce was never
-                        // used and must go back, or it becomes a hole the whole
-                        // chain's coordinator sequence stalls behind.
-                        if e.is_builder_rejection() {
-                            self.recycle_nonce(put_inbox_nonce, 1, "receive_bundle_rejected")
-                                .await;
-                        }
-                        if let Err(resync_err) = self.resync_put_inbox_nonce_monotonic().await {
-                            warn!(error = %resync_err, "Failed to resync putInbox nonce after submit error");
-                        }
+                        // The bundle carries the coordinator's putInbox: either
+                        // snap to the nonce the builder asked for, or hand this
+                        // one back, so the chain's coordinator sequence does not
+                        // stall behind it.
+                        self.reconcile_nonce_after_rejection(
+                            &e,
+                            put_inbox_nonce,
+                            1,
+                            "receive_bundle_rejected",
+                        )
+                        .await;
                         warn!("Failed to submit putInbox+receive bundle: {e}");
                         let _ = self
                             .send_vote(transaction_chunk.instance_id.as_str(), false)
@@ -1379,6 +1379,26 @@ impl DefaultCoordinator {
                                 };
 
                                 if let Err(e) = result {
+                                    if e.is_unknown_instance() {
+                                        // Already dropped at the builder along
+                                        // with its un-executed transactions —
+                                        // nothing to compensate, and no retry
+                                        // can change that.
+                                        xtflow!(
+                                            "abort_not_applicable",
+                                            instance_id = transaction_chunk.instance_id,
+                                            chain = self.chain_id,
+                                            side = "receiver",
+                                            call = "recvAbort",
+                                            reason = "instance already dropped at builder",
+                                        );
+                                        self.mark_confirmed_stage(
+                                            transaction_chunk.instance_id.as_str(),
+                                            Aborted,
+                                        )
+                                        .await;
+                                        return;
+                                    }
                                     xtflow!(
                                         "abort_err",
                                         instance_id = transaction_chunk.instance_id,
@@ -1486,6 +1506,22 @@ impl DefaultCoordinator {
         };
 
         if let Err(e) = result {
+            if e.is_unknown_instance() {
+                // The instance was already dropped at the builder (a period
+                // tick aborts it there and locally at the same time), taking
+                // its un-executed transactions with it. There is no escrow
+                // left to refund, so this is done, not failed — retrying would
+                // only repeat the same rejection and raise a false alarm.
+                xtflow!(
+                    "abort_not_applicable",
+                    instance_id = transaction_chunk.instance_id,
+                    chain = self.chain_id,
+                    side = "sender",
+                    call = "sendAbort",
+                    reason = "instance already dropped at builder",
+                );
+                return Compensation::NotApplicable;
+            }
             xtflow!(
                 "abort_err",
                 instance_id = transaction_chunk.instance_id,

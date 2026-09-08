@@ -1,5 +1,6 @@
 //! Sidecar binary entrypoint.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +34,15 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use compose_coordinator::coordinator::ChunkStage::{Aborted, Registered};
 
+/// Depth of the internal work queues (publisher messages, chunk signals).
+///
+/// Deliberately far larger than any backlog a run should produce: a full queue
+/// makes `send().await` block its producer, which for the publisher consumer
+/// means stalling the whole control-plane connection. Sized to never be the
+/// thing that pushes back, so real throughput limits show up as a growing
+/// `dispatch_done … queued=` instead of as a stall.
+const CHANNEL_CAPACITY: usize = 3_000_000;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = SidecarArgs::parse();
@@ -51,7 +61,7 @@ async fn main() -> Result<()> {
     // `chunk_sender` is a plain field, so anything set afterwards is invisible
     // to them. With the order reversed the watchdog could log its finalization
     // retries but never enqueue them.
-    let (tx, rx) = mpsc::channel::<String>(300);
+    let (tx, rx) = mpsc::channel::<String>(CHANNEL_CAPACITY);
     coordinator.set_chunk_sender(tx.clone());
 
     coordinator.start().await?;
@@ -227,6 +237,18 @@ fn build_coordinator(
 }
 
 fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<QuicClient>, tx: Sender<String>) {
+    // Publisher messages are processed by a single consumer, in arrival order.
+    //
+    // Spawning a task per message let them race: `handle_start_instance`
+    // requires strictly increasing sequence numbers and `handle_start_period`
+    // moves the period, so whichever task lost the race for the state lock was
+    // rejected as "stale sequence"/"stale period". Rare at 10 XT/s, constant
+    // once several submitters run in parallel.
+    //
+    // The reader stays a separate task so a slow handler never stops draining
+    // the socket.
+    let (msg_tx, mut msg_rx) = mpsc::channel(CHANNEL_CAPACITY);
+
     tokio::spawn(async move {
         info!("Connecting to publisher");
         if let Err(e) = client.connect_with_retry().await {
@@ -238,11 +260,10 @@ fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<
         loop {
             match client.recv().await {
                 Ok(data) => {
-                    let coord = coordinator.clone();
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        handle_publisher_message(coord, data, tx).await;
-                    });
+                    if msg_tx.send(data).await.is_err() {
+                        warn!("Publisher message consumer gone, stopping receive loop");
+                        break;
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "Publisher receive error, connection may be lost");
@@ -253,12 +274,48 @@ fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<
 
         warn!("Publisher receive loop ended");
     });
+
+    tokio::spawn(async move {
+        while let Some(data) = msg_rx.recv().await {
+            handle_publisher_message(coordinator.clone(), data, tx.clone()).await;
+        }
+        warn!("Publisher message consumer ended");
+    });
 }
 
 fn spawn_chunk_processor(coordinator: Arc<DefaultCoordinator>, mut rx: Receiver<String>){
     tokio::spawn(async move {
         info!("Starting chunk processor");
-        while let Some(instance_id) = rx.recv().await {
+        let mut batch: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        while let Some(first) = rx.recv().await {
+            // Coalesce the duplicates that piled up while the previous batch
+            // was being processed. A signal only means "something changed for
+            // this instance, go look", so N queued signals for one instance
+            // are worth exactly one dispatch — and under load most of them
+            // were: 52% of dispatches in a 50 XT/s run were `dispatch_skip`
+            // no-ops. Draining preserves arrival order so no instance is
+            // starved by a busier one.
+            batch.clear();
+            seen.clear();
+            seen.insert(first.clone());
+            batch.push(first);
+            while let Ok(id) = rx.try_recv() {
+                if seen.insert(id.clone()) {
+                    batch.push(id);
+                }
+            }
+            if batch.len() > 1 {
+                xtflow!(
+                    "dispatch_batch",
+                    unique = batch.len(),
+                    coalesced = seen.len(),
+                    queued = rx.len(),
+                );
+            }
+
+            for instance_id in std::mem::take(&mut batch) {
             // Always dispatch on a fresh fetch of the chunk's current state
             // rather than any snapshot carried by the signal itself — the
             // signal only ever means "something changed for this instance,
@@ -327,6 +384,7 @@ fn spawn_chunk_processor(coordinator: Arc<DefaultCoordinator>, mut rx: Receiver<
                 took_ms = dispatch_started.elapsed().as_millis(),
                 queued = rx.len(),
             );
+            }
         }
     });
 }

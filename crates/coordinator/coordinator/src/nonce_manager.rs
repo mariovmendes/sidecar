@@ -100,6 +100,27 @@ impl DeferredNonceManager {
         }
     }
 
+    /// Snap the counter to a nonce the builder explicitly asked for, in either
+    /// direction, discarding recycled nonces that are no longer valid.
+    ///
+    /// The only caller is a nonce-gap rejection, where the builder has told us
+    /// precisely which nonce it will accept next. That answer supersedes the
+    /// local counter — including moving it *down*, which no other path may do,
+    /// because the alternative is re-offering a refused nonce forever.
+    ///
+    /// The free list is discarded wholesale, not filtered: its entries were
+    /// derived from the counter the builder just contradicted, and since
+    /// `reserve` prefers the lowest freed nonce, keeping any of them would hand
+    /// back the very value that was refused. `expected` is by definition the
+    /// first nonce the builder will take, so counting up from it covers every
+    /// hole below it.
+    pub(crate) async fn force_set(&self, nonce: u64) {
+        let mut inner = self.inner.lock().await;
+        inner.next_nonce = nonce;
+        inner.initialized = true;
+        inner.freed.clear();
+    }
+
     /// Number of recycled nonces currently waiting to be reused. Exposed for
     /// the liveness dump.
     pub(crate) async fn freed_count(&self) -> usize {
@@ -211,6 +232,28 @@ mod tests {
 
         // A two-nonce reservation must not start from the free list.
         assert_eq!(manager.reserve(2, || async { Ok(0) }).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn force_set_moves_the_counter_down_and_drops_stale_recycled_nonces() {
+        // The livelock this exists to break: the counter has run ahead of the
+        // builder (a mass abort retracted reservations), and the refused nonce
+        // sits in the free list ready to be offered again and refused again.
+        let manager = DeferredNonceManager::new();
+
+        assert_eq!(manager.reserve(1, || async { Ok(5155) }).await.unwrap(), 5155);
+        manager.release(5155, 1).await;
+        assert_eq!(manager.freed_count().await, 0); // tail giveback
+        assert_eq!(manager.reserve(1, || async { Ok(0) }).await.unwrap(), 5155);
+        assert_eq!(manager.reserve(1, || async { Ok(0) }).await.unwrap(), 5156);
+        manager.release(5155, 1).await; // refused again, now parked in `freed`
+        assert_eq!(manager.freed_count().await, 1);
+
+        // The builder says it wants 5146. That answer wins.
+        manager.force_set(5146).await;
+        assert_eq!(manager.freed_count().await, 0, "stale recycled nonces must go");
+        assert_eq!(manager.reserve(1, || async { Ok(0) }).await.unwrap(), 5146);
+        assert_eq!(manager.reserve(1, || async { Ok(0) }).await.unwrap(), 5147);
     }
 
     #[tokio::test]

@@ -6,15 +6,14 @@ use std::collections::HashMap;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info, warn};
 
-use crate::coordinator::DefaultCoordinator;
+use crate::coordinator::{DefaultCoordinator, MAX_PENDING_XTS};
 use crate::model::pending_xt::PendingXt;
 use crate::pipeline::delivery::{build_sender_nonce_cache, describe_txs};
 use crate::pipeline::submission::xt_request_fingerprint;
 use compose_primitives::xtflow;
 use compose_primitives_traits::CoordinatorError;
 
-/// Maximum number of pending XTs before new submissions are rejected.
-const MAX_PENDING_XTS: usize = 100;
+
 
 impl DefaultCoordinator {
     /// Process a new instance from the publisher. Validates the period and
@@ -126,20 +125,19 @@ impl DefaultCoordinator {
             return Ok(());
         }
 
+        // Out-of-order arrival is not an error. The publisher assigns sequence
+        // numbers in order, but each message reaches us on its own QUIC stream
+        // (`open_uni`/`accept_uni`), and QUIC only orders *within* a stream —
+        // so a strictly-increasing arrival check rejects perfectly valid
+        // instances as soon as more than one submitter is active.
+        //
+        // Nothing downstream needs arrival order either: the builder keys its
+        // executable set on `XtOrderKey { period_id, sequence_number }`
+        // (`ordered_instances`), so an instance that arrives late is still
+        // executed in its assigned position. Duplicates are the only thing
+        // worth refusing, and the `pending` check above already does that.
         let msg_seq = SequenceNumber(msg.sequence_number);
-        if msg_seq <= state.last_sequence_num {
-            drop(state);
-            self.resolve_pending_submission(
-                &fingerprint,
-                Err(CoordinatorError::StaleSequence.to_string()),
-            )
-            .await;
-            warn!(instance_id = %instance_id, "Stale sequence, rejecting");
-            self.reject_start_instance(&instance_id, msg).await;
-            return Ok(());
-        }
-
-        state.last_sequence_num = msg_seq;
+        state.last_sequence_num = state.last_sequence_num.max(msg_seq);
 
         let mut xt = PendingXt::new(instance_id.to_string(), msg.instance_id.clone());
         xt.period_id = msg_period;
