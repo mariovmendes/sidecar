@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use compose_primitives::ChainId;
 use compose_primitives_traits::{CoordinatorError, PublisherClient};
-use compose_proto::{wire_message::Payload, Vote};
+use compose_proto::{wire_message::Payload, Confirmed, Vote};
 use compose_transport::traits::Transport;
 use prost::Message;
 
@@ -68,6 +68,25 @@ impl PublisherClient for PublisherConnection {
                 instance_id: instance_id.to_vec(),
                 chain_id: self.chain_id.0,
                 vote,
+            })),
+        };
+
+        self.transport
+            .send(Bytes::from(msg.encode_to_vec()))
+            .await
+            .map_err(|e| CoordinatorError::Other(e.to_string()))
+    }
+
+    async fn send_confirmed(
+        &self,
+        instance_id: &[u8],
+        chain_id: u64,
+    ) -> Result<(), CoordinatorError> {
+        let msg = compose_proto::WireMessage {
+            sender_id: String::new(),
+            payload: Some(Payload::Confirmed(Confirmed {
+                instance_id: instance_id.to_vec(),
+                chain_id,
             })),
         };
 

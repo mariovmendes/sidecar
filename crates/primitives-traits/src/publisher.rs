@@ -19,6 +19,13 @@ pub trait PublisherClient: Send + Sync + 'static {
     /// Send a vote for a cross-chain transaction instance.
     async fn send_vote(&self, instance_id: &[u8], vote: bool) -> Result<(), CoordinatorError>;
 
+    /// Send confirmation of cross-chain transaction inclusion.
+    async fn send_confirmed(
+        &self,
+        instance_id: &[u8],
+        chain_id: u64,
+    ) -> Result<(), CoordinatorError>;
+
     /// Send raw protobuf-encoded data to the publisher.
     async fn send_raw(&self, data: &[u8]) -> Result<(), CoordinatorError>;
 

@@ -604,6 +604,14 @@ mod tests {
             Ok(())
         }
 
+        async fn send_confirmed(
+            &self,
+            _instance_id: &[u8],
+            _chain_id: u64,
+        ) -> Result<(), CoordinatorError> {
+            Ok(())
+        }
+
         async fn send_raw(&self, _data: &[u8]) -> Result<(), CoordinatorError> {
             self.send_raw_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())

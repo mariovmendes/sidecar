@@ -93,6 +93,14 @@ pub struct Decided {
 }
 
 #[derive(Clone, PartialEq, Eq, Message)]
+pub struct Confirmed {
+    #[prost(bytes = "vec", tag = "1")]
+    pub instance_id: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub chain_id: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Message)]
 pub struct MailboxMessage {
     /// 32-byte big-endian session ID matching the contract's uint256 sessionId.
     #[prost(bytes = "vec", tag = "1")]
@@ -169,7 +177,7 @@ pub struct WireMessage {
     pub sender_id: String,
     #[prost(
         oneof = "wire_message::Payload",
-        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
     )]
     pub payload: Option<wire_message::Payload>,
 }
@@ -208,5 +216,7 @@ pub mod wire_message {
         NativeDecided(super::NativeDecided),
         #[prost(message, tag = "15")]
         WsDecided(super::WsDecided),
+        #[prost(message, tag = "16")]
+        Confirmed(super::Confirmed),
     }
 }

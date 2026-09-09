@@ -7,7 +7,7 @@ use crate::{
 };
 use compose_primitives::CrossRollupDependency;
 use compose_primitives_traits::CoordinatorError;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
 pub(crate) struct XtBuilderSubmission {
@@ -213,16 +213,40 @@ impl DefaultCoordinator {
         &self,
         instance_ids: &[String],
     ) -> Result<(), CoordinatorError> {
-        let mut state = self.state.write().await;
-        let now = std::time::Instant::now();
-        for instance_id in instance_ids {
-            if let Some(xt) = state.pending.get_mut(instance_id.as_str()) {
-                xt.confirmed_at = Some(now);
-                info!(instance_id = %instance_id, "XT confirmed included by builder");
-            } else {
-                warn!(instance_id = %instance_id, "confirm received for unknown XT");
+        let confirmed: Vec<(Vec<u8>, String)> = {
+            let mut state = self.state.write().await;
+            let now = std::time::Instant::now();
+            let mut confirmed = Vec::new();
+            for instance_id in instance_ids {
+                if let Some(xt) = state.pending.get_mut(instance_id.as_str()) {
+                    xt.confirmed_at = Some(now);
+                    confirmed.push((xt.instance_id.clone(), instance_id.clone()));
+                    info!(instance_id = %instance_id, "XT confirmed included by builder");
+                } else {
+                    warn!(instance_id = %instance_id, "confirm received for unknown XT");
+                }
+            }
+            confirmed
+        };
+
+        // Forward confirmations to the publisher (best-effort).
+        if let Some(publisher) = &self.publisher {
+            if publisher.is_connected() {
+                for (instance_id_bytes, instance_id_str) in &confirmed {
+                    if let Err(e) = publisher
+                        .send_confirmed(instance_id_bytes, self.chain_id.0)
+                        .await
+                    {
+                        error!(
+                            instance_id = %instance_id_str,
+                            error = %e,
+                            "Failed to send confirmed to publisher"
+                        );
+                    }
+                }
             }
         }
+
         Ok(())
     }
 
