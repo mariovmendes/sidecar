@@ -91,7 +91,7 @@ impl DefaultCoordinator {
 mod tests {
     use compose_primitives::ChainId;
 
-    use crate::coordinator::{DefaultCoordinator, VerificationConfig};
+    use crate::coordinator::{DefaultCoordinator};
     use crate::model::pending_xt::PendingXt;
 
     #[tokio::test]
@@ -104,7 +104,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -142,7 +141,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {

@@ -4,7 +4,6 @@ use crate::coordinator::ChunkStage::{
     Aborted, Confirmed, Registered, WaitingForDecided, WaitingForMessages,
 };
 use crate::coordinator::{ChunkStage, DefaultCoordinator, TransactionChunk};
-use crate::model::chain_overlay::ChainOverlay;
 use crate::pipeline::delivery::{decode_sender_nonce, describe_local_txs};
 use compose_primitives::xtflow;
 use alloy::consensus::{Transaction, TxEnvelope};
@@ -14,27 +13,14 @@ use compose_mailbox::contract::{
     approveCall, bridgeCETToCall, bridgeERC20ToCall, bridgeEthToCall, receiveETHCall,
     receiveTokensCall,
 };
-use compose_mailbox::matching::{
-    contains_message, matches_dependency, DependencyKey, MailboxMessageKey,
-};
+use compose_mailbox::matching::matches_dependency;
 use compose_mailbox::overrides::merge_overrides;
 use compose_mailbox::wire;
-use compose_primitives::{ChainId, CrossRollupDependency, CrossRollupMessage, StateOverride};
+use compose_primitives::{ChainId, CrossRollupDependency, StateOverride};
 use compose_primitives_traits::{SendAbortEthParams, SendAbortTokenParams};
 use compose_proto::MailboxMessage;
 use compose_simulation::error::SimulationError;
-use serde::Serialize;
-use std::time::{Duration, Instant as StdInstant};
-use tokio::time::{sleep_until, Instant};
 use tracing::{debug, error, info, warn};
-
-#[derive(Debug, Serialize)]
-struct VerificationPayload<'a> {
-    instance_id: &'a str,
-    dest_chain_id: u64,
-    origin_chain_id: Option<u64>,
-    txs: Vec<String>,
-}
 
 /// Result of trying to put an XT's compensation on chain.
 enum Compensation {
@@ -125,11 +111,6 @@ impl DefaultCoordinator {
                             "Simulation state check"
                         );
 
-                        /*let mut overrides = StateOverride::default();
-                        if let Some(chain_overlay) = state.chain_overlay.get(&self.chain_id) {
-                            merge_overrides(&mut overrides, &chain_overlay.overlay);
-                        }*/
-
                         txs.clone()
                     }
                     _ => {
@@ -153,13 +134,6 @@ impl DefaultCoordinator {
                 }
             }
         };
-
-        /*
-        if let Err(err) = self.verify_xt(instance_id, &tx_bytes_list).await {
-            warn!(instance_id, error = %err, "Verification hook rejected XT");
-            let _ = self.send_vote(instance_id, false).await;
-            return;
-        }*/
 
         let simulator = match &self.simulator {
             Some(s) => s.clone(),
@@ -1683,254 +1657,6 @@ impl DefaultCoordinator {
         }
     }
 
-    async fn verify_xt(&self, instance_id: &str, txs: &[Vec<u8>]) -> Result<(), String> {
-        if !self.verification.enabled {
-            return Ok(());
-        }
-
-        let origin_chain = {
-            let state = self.state.read().await;
-            state
-                .pending
-                .get(instance_id)
-                .and_then(|xt| xt.origin_chain)
-        };
-
-        let payload = VerificationPayload {
-            instance_id,
-            dest_chain_id: self.chain_id.0,
-            origin_chain_id: origin_chain.map(|cid| cid.0),
-            txs: txs.iter().map(hex::encode).collect(),
-        };
-
-        let client = self
-            .verification_client
-            .as_ref()
-            .ok_or_else(|| "verification client not configured".to_string())?;
-
-        let response = client
-            .post(&self.verification.url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("verification request failed: {e}"))?;
-
-        if !response.status().is_success() {
-            return Err(format!(
-                "verification rejected with status {}",
-                response.status()
-            ));
-        }
-
-        debug!(
-            instance_id,
-            url = %self.verification.url,
-            timeout_ms = self.verification.timeout_ms,
-            ?payload,
-            "Verification hook approved XT"
-        );
-
-        Ok(())
-    }
-
-    /// Record simulation results into XT state, update the chain overlay with
-    /// the post-simulation overrides so subsequent XTs see the committed state,
-    /// and return the overrides for the next simulation step.
-    async fn record_simulation_state(
-        &self,
-        instance_id: &str,
-        result: &compose_primitives::SimulationResult,
-        base_overrides: &StateOverride,
-    ) -> StateOverride {
-        let mut state = self.state.write().await;
-        let Some(xt) = state.pending.get_mut(instance_id) else {
-            return base_overrides.clone();
-        };
-
-        let mut merged_overrides = base_overrides.clone();
-        if result.success {
-            if let Some(ref result_overrides) = result.state_overrides {
-                merge_overrides(&mut merged_overrides, result_overrides);
-            }
-        }
-
-        for dep in &result.dependencies {
-            let key = DependencyKey::from(dep);
-            if xt.dep_keys.insert(key) {
-                xt.dependencies.push(dep.clone());
-            }
-        }
-
-        for msg in &result.outbound_messages {
-            if !contains_message(&xt.outbound_messages, msg) {
-                xt.outbound_messages.push(msg.clone());
-            }
-        }
-
-        // Update the chain overlay so the next XT simulated on this chain sees
-        // the accumulated post-simulation state.
-        if result.success {
-            let overlay = state
-                .chain_overlay
-                .entry(self.chain_id)
-                .or_insert_with(ChainOverlay::new);
-            merge_overrides(&mut overlay.overlay, &merged_overrides);
-        }
-
-        merged_overrides
-    }
-
-    /// Wait until at least one dependency is fulfilled or the CIRC timeout
-    /// expires. Uses `Notify` to wake immediately when a mailbox message
-    /// arrives, replacing the previous 50 ms busy-poll loop.
-    async fn wait_for_dependencies(
-        &self,
-        instance_id: &str,
-        deps: &[CrossRollupDependency],
-    ) -> bool {
-        let deadline = Instant::now() + Duration::from_millis(self.circ_timeout_ms);
-        let wait_started = StdInstant::now();
-        loop {
-            let fulfilled = self
-                .fulfill_dependencies_from_mailbox(instance_id, deps)
-                .await;
-            if fulfilled > 0 {
-                if let Some(m) = &self.metrics {
-                    m.mailbox_wait_duration_seconds
-                        .observe(wait_started.elapsed().as_secs_f64());
-                }
-                return true;
-            }
-            if Instant::now() >= deadline {
-                if let Some(m) = &self.metrics {
-                    m.mailbox_wait_duration_seconds
-                        .observe(wait_started.elapsed().as_secs_f64());
-                    m.mailbox_wait_timeout_total.inc();
-                }
-                return false;
-            }
-            // Clone the Arc before dropping the lock so we can call .notified()
-            // outside the critical section. This avoids missing a notification
-            // that arrives between the dependency check above and the select below.
-            let notify = {
-                let state = self.state.read().await;
-                state.mailbox_notify.clone()
-            };
-            tokio::select! {
-                _ = notify.notified() => {}
-                _ = sleep_until(deadline) => {
-                    if let Some(m) = &self.metrics {
-                        m.mailbox_wait_duration_seconds
-                            .observe(wait_started.elapsed().as_secs_f64());
-                        m.mailbox_wait_timeout_total.inc();
-                    }
-                    return false;
-                }
-            }
-        }
-    }
-
-    async fn fulfill_dependencies_from_mailbox(
-        &self,
-        instance_id: &str,
-        deps: &[CrossRollupDependency],
-    ) -> usize {
-        let mut added = 0usize;
-
-        let mut state = self.state.write().await;
-        let Some(xt) = state.pending.get_mut(instance_id) else {
-            return 0;
-        };
-
-        for dep in deps {
-            let key = DependencyKey::from(dep);
-            if xt.fulfilled_dep_keys.contains(&key) {
-                continue;
-            }
-
-            if let Some(idx) = xt
-                .pending_mailbox
-                .iter()
-                .position(|msg| matches_dependency(msg, dep))
-            {
-                let mailbox_msg = xt.pending_mailbox.remove(idx);
-                let mut fulfilled = dep.clone();
-                fulfilled.data = Some(mailbox_msg.payload.clone());
-                xt.fulfilled_dep_keys.insert(key);
-                xt.fulfilled_deps.push(fulfilled);
-                added += 1;
-            }
-        }
-
-        if added > 0 {
-            info!(
-                instance_id,
-                fulfilled = added,
-                total_fulfilled = xt.fulfilled_deps.len(),
-                "Fulfilled dependencies from mailbox messages"
-            );
-        }
-
-        added
-    }
-
-    async fn dispatch_outbound_mailbox(
-        &self,
-        instance_id: &str,
-        outbound_messages: &[CrossRollupMessage],
-    ) -> Result<(), compose_primitives_traits::CoordinatorError> {
-        if outbound_messages.is_empty() {
-            return Ok(());
-        }
-
-        let Some(sender) = self.mailbox_sender.as_ref().cloned() else {
-            warn!(
-                instance_id,
-                "Mailbox sender not configured, skipping outbound mailbox delivery"
-            );
-            return Ok(());
-        };
-
-        let mut to_send = Vec::<MailboxMessage>::new();
-        {
-            let mut state = self.state.write().await;
-            let Some(xt) = state.pending.get_mut(instance_id) else {
-                return Ok(());
-            };
-
-            for msg in outbound_messages {
-                let mailbox_msg = MailboxMessage {
-                    instance_id: xt.instance_id.clone(),
-                    source_chain: msg.source_chain_id.0,
-                    destination_chain: msg.dest_chain_id.0,
-                    sender: msg.sender.as_slice().to_vec(),
-                    receiver: msg.receiver.as_slice().to_vec(),
-                    label: msg.label.clone(),
-                    payload: msg.data.clone(),
-                    session_id: wire::encode_session_id(msg.session_id),
-                };
-
-                let key = MailboxMessageKey::from(&mailbox_msg);
-                if xt.sent_mailbox_keys.insert(key) {
-                    xt.sent_mailbox.push(mailbox_msg.clone());
-                    to_send.push(mailbox_msg);
-                }
-            }
-        }
-
-        let sent_count = to_send.len();
-        for msg in to_send {
-            sender.send(ChainId(msg.destination_chain), &msg).await?;
-        }
-        if sent_count > 0 {
-            if let Some(m) = &self.metrics {
-                m.circ_messages_sent_total.inc_by(sent_count as u64);
-            }
-        }
-
-        Ok(())
-    }
-
     /// Send a vote for the given instance.
     pub(crate) async fn send_vote(
         &self,
@@ -1986,7 +1712,6 @@ impl DefaultCoordinator {
             );
             xt.vote_sent = true;
             xt.local_vote = Some(vote);
-            xt.locked_chains.insert(self.chain_id);
             if standalone_mode {
                 decision_made = self.maybe_make_standalone_decision(xt);
                 if let Some((decision, _, _)) = decision_made {
@@ -2109,64 +1834,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::{net::TcpListener, task::JoinHandle};
 
-    use crate::coordinator::{DefaultCoordinator, TransactionChunk, VerificationConfig};
+    use crate::coordinator::{DefaultCoordinator, TransactionChunk};
     use crate::model::chain_overlay::ChainOverlay;
     use crate::model::pending_xt::PendingXt;
-
-    #[derive(Clone)]
-    struct VerificationServerState {
-        hits: Arc<AtomicUsize>,
-        status: StatusCode,
-        body: &'static str,
-    }
-
-    struct TestVerificationServer {
-        hits: Arc<AtomicUsize>,
-        task: JoinHandle<()>,
-        url: String,
-    }
-
-    impl TestVerificationServer {
-        async fn spawn(status: StatusCode, body: &'static str) -> Self {
-            let hits = Arc::new(AtomicUsize::new(0));
-            let app = Router::new()
-                .route("/verify", post(test_verification_handler))
-                .with_state(VerificationServerState {
-                    hits: hits.clone(),
-                    status,
-                    body,
-                });
-
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let task = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
-
-            Self {
-                hits,
-                task,
-                url: format!("http://{addr}/verify"),
-            }
-        }
-
-        fn assert_hits(&self, expected: usize) {
-            assert_eq!(self.hits.load(Ordering::SeqCst), expected);
-        }
-    }
-
-    impl Drop for TestVerificationServer {
-        fn drop(&mut self) {
-            self.task.abort();
-        }
-    }
-
-    async fn test_verification_handler(
-        State(state): State<VerificationServerState>,
-    ) -> (StatusCode, &'static str) {
-        state.hits.fetch_add(1, Ordering::SeqCst);
-        (state.status, state.body)
-    }
 
     #[tokio::test]
     async fn send_vote_does_not_overwrite_existing_local_vote() {
@@ -2178,7 +1848,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -2205,7 +1874,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -2235,7 +1903,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -2410,7 +2077,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -2433,86 +2099,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_xt_verification_allows_commit_on_success_response() {
-        let server = TestVerificationServer::spawn(StatusCode::OK, "I confirm").await;
-
-        let simulator = Arc::new(StubSimulator { succeed: true });
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            Some(simulator),
-            None,
-            None,
-            None,
-            None,
-            1000,
-            VerificationConfig {
-                enabled: true,
-                url: server.url.clone(),
-                timeout_ms: 2_000,
-            },
-        );
-
-        {
-            let mut state = coordinator.state.write().await;
-            let mut xt = PendingXt::new("xt-77777-verify".to_string(), b"xt-77777-verify".to_vec());
-            xt.raw_txs.insert(ChainId(77777), vec![vec![0xab, 0xcd]]);
-            state.pending.insert(xt.id.clone(), xt);
-        }
-
-        coordinator
-            .register_xt(&mut TransactionChunk {
-                instance_id: "xt-77777-verify".to_string(),
-                ..Default::default()
-            })
-            .await;
-
-        server.assert_hits(1);
-        let state = coordinator.state.read().await;
-        let xt = state.pending.get("xt-77777-verify").unwrap();
-        assert_eq!(xt.local_vote, Some(true));
-    }
-
-    #[tokio::test]
-    async fn process_xt_verification_abort_on_reject_response() {
-        let server = TestVerificationServer::spawn(StatusCode::FORBIDDEN, "reject").await;
-
-        let simulator = Arc::new(StubSimulator { succeed: true });
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            Some(simulator),
-            None,
-            None,
-            None,
-            None,
-            1000,
-            VerificationConfig {
-                enabled: true,
-                url: server.url.clone(),
-                timeout_ms: 2_000,
-            },
-        );
-
-        {
-            let mut state = coordinator.state.write().await;
-            let mut xt = PendingXt::new("xt-77777-reject".to_string(), b"xt-77777-reject".to_vec());
-            xt.raw_txs.insert(ChainId(77777), vec![vec![0xab, 0xcd]]);
-            state.pending.insert(xt.id.clone(), xt);
-        }
-
-        coordinator
-            .register_xt(&mut TransactionChunk {
-                instance_id: "xt-77777-reject".to_string(),
-                ..Default::default()
-            })
-            .await;
-
-        server.assert_hits(1);
-        let state = coordinator.state.read().await;
-        let xt = state.pending.get("xt-77777-reject").unwrap();
-        assert_eq!(xt.local_vote, Some(false));
-    }
-
-    #[tokio::test]
     async fn process_xt_votes_false_on_simulation_error() {
         let simulator = Arc::new(StubSimulator { succeed: false });
         let coordinator = DefaultCoordinator::new(
@@ -2523,7 +2109,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -2555,7 +2140,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -2606,7 +2190,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         let mut base_overrides = StateOverride::default();
@@ -2684,7 +2267,6 @@ mod tests {
             None,
             None,
             10_000,
-            VerificationConfig::default(),
         );
 
         {

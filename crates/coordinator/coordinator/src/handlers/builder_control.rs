@@ -757,9 +757,6 @@ mod tests {
     use compose_primitives::{ChainId, PeriodId, SequenceNumber};
     use compose_primitives_traits::PutInboxBuilder;
     use tokio::sync::Mutex;
-
-    use crate::coordinator::VerificationConfig;
-
     #[derive(Debug)]
     struct TestPutInboxBuilder {
         canonical_nonce: Mutex<u64>,
@@ -826,7 +823,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -866,7 +862,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
         let mut xt = PendingXt::new("xt-77777-2".to_string(), b"xt-77777-2".to_vec());
         xt.period_id = PeriodId(11);
@@ -890,7 +885,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
         let builder = Arc::new(TestPutInboxBuilder::new(7));
         coordinator.set_put_inbox_builder(builder.clone());
@@ -937,7 +931,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
         coordinator.set_put_inbox_builder(Arc::new(TestPutInboxBuilder::new(20)));
 
@@ -976,7 +969,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
         let builder = Arc::new(TestPutInboxBuilder::new(7));
         coordinator.set_put_inbox_builder(builder.clone());

@@ -9,7 +9,7 @@ use clap::Parser;
 use compose_config::{MockProofArgs, SidecarArgs};
 use compose_coordinator::builder::CoordinatorBuilder;
 use compose_coordinator::builder_client::HttpXtBuilderClient;
-use compose_coordinator::coordinator::{DefaultCoordinator, TransactionChunk, VerificationConfig};
+use compose_coordinator::coordinator::{DefaultCoordinator, TransactionChunk};
 use compose_coordinator::coordinator::ChunkStage::*;
 use compose_mailbox::l2_bridge::L2BridgeContractTxBuilder;
 use compose_mailbox::put_inbox::PutInboxTxBuilder;
@@ -179,12 +179,6 @@ fn build_coordinator(
     }
 
     builder = builder.mailbox_queue(Arc::new(InMemoryQueue::new()));
-
-    builder = builder.verification_config(VerificationConfig {
-        enabled: args.verification.enabled,
-        url: args.verification.url.clone(),
-        timeout_ms: args.verification.timeout_ms,
-    });
 
     let peer_entries = args.peers.entries()?;
     if !peer_entries.is_empty() {

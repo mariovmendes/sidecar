@@ -9,8 +9,7 @@ use compose_peer::traits::PeerCoordinator;
 use compose_primitives::{ChainId, InstanceId, PeriodId, SequenceNumber, SuperblockNumber};
 use compose_simulation::traits::Simulator;
 use prost::Message;
-use reqwest::Client;
-use tokio::sync::{oneshot, Notify, RwLock};
+use tokio::sync::{oneshot, RwLock};
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
@@ -31,14 +30,6 @@ use compose_primitives::xtflow;
 
 type PendingSubmissionResult = Result<InstanceId, String>;
 type PendingSubmissionSender = oneshot::Sender<PendingSubmissionResult>;
-
-/// Inbound verification hook configuration.
-#[derive(Debug, Clone, Default)]
-pub struct VerificationConfig {
-    pub enabled: bool,
-    pub url: String,
-    pub timeout_ms: u64,
-}
 
 // Transaction chunks
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -118,8 +109,6 @@ pub(crate) struct CoordinatorState {
     /// Per-chain overlay of post-simulation state diffs. Lets XT-B see the
     /// state produced by XT-A within the current coordinator window.
     pub chain_overlay: HashMap<ChainId, ChainOverlay>,
-    /// Notified whenever a mailbox message arrives, waking waiting simulations.
-    pub mailbox_notify: Arc<Notify>,
     /// Maps XT fingerprints to instance IDs for standalone-mode deduplication.
     pub submitted_fingerprints: HashMap<String, InstanceId>,
     /// Oneshot channels waiting for the publisher to assign an instance ID
@@ -150,7 +139,6 @@ impl CoordinatorState {
             last_known_blocks: HashMap::new(),
             origin_seq: SequenceNumber(0),
             chain_overlay: HashMap::new(),
-            mailbox_notify: Arc::new(Notify::new()),
             submitted_fingerprints: HashMap::new(),
             pending_submissions: HashMap::new(),
             mailbox_index: HashMap::new(),
@@ -158,18 +146,6 @@ impl CoordinatorState {
             inflight_chunks: HashMap::new(),
             mailbox_messages: HashMap::new(),
         }
-    }
-
-    /// Buffer a mailbox message for an XT that has not yet been registered.
-    ///
-    /// Called when a CIRC message arrives before the forwarded XT, which can
-    /// happen when sidecar-a's simulation completes in <1 ms and the outbound
-    /// message reaches sidecar-b before the XT forward does.
-    pub(crate) fn buffer_orphan_mailbox(&mut self, msg: MailboxMessage) {
-        self.mailbox_buffer
-            .entry(msg.instance_id.clone())
-            .or_default()
-            .push(msg);
     }
 
     /// Drain any buffered mailbox messages for the given raw `instance_id` key
@@ -198,8 +174,6 @@ pub struct DefaultCoordinator {
     pub(crate) circ_timeout_ms: u64,
     pub(crate) task_tracker: TaskTracker,
     pub(crate) metrics: Option<Arc<SidecarMetrics>>,
-    pub(crate) verification: VerificationConfig,
-    pub(crate) verification_client: Option<Client>,
     pub(crate) chunk_sender: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
@@ -222,7 +196,6 @@ impl DefaultCoordinator {
         mailbox_queue: Option<Arc<dyn MailboxQueue>>,
         peer_coordinator: Option<Arc<dyn PeerCoordinator>>,
         circ_timeout_ms: u64,
-        verification: VerificationConfig,
     ) -> Self {
         Self {
             chain_id,
@@ -239,8 +212,6 @@ impl DefaultCoordinator {
             circ_timeout_ms,
             task_tracker: TaskTracker::new(),
             metrics: None,
-            verification_client: Self::build_verification_client(&verification),
-            verification,
             chunk_sender: None,
         }
     }
@@ -275,7 +246,7 @@ impl DefaultCoordinator {
         self.l2_bridge_builder = Some(builder);
     }
 
-    /// Current inflight chunk for `instance_id`, if any — a fresh clone, read
+    /// Current inflight chunk for `instance_id`, if any, a fresh clone, read
     /// and released immediately. This is the single source of truth the
     /// chunk processor dispatches on; callers must not hold a chunk fetched
     /// this way across a call into `register_xt`/`process_xt`/`confirm_xt`/
@@ -287,19 +258,6 @@ impl DefaultCoordinator {
             .inflight_chunks
             .get(instance_id)
             .cloned()
-    }
-
-    fn build_verification_client(verification: &VerificationConfig) -> Option<Client> {
-        if !verification.enabled {
-            return None;
-        }
-
-        Some(
-            Client::builder()
-                .timeout(Duration::from_millis(verification.timeout_ms))
-                .build()
-                .expect("verification client configuration should be valid"),
-        )
     }
 
     /// Start the coordinator's background tasks (cleanup loop, etc.).
@@ -396,10 +354,10 @@ impl DefaultCoordinator {
     /// Periodic liveness dump. The sidecar has no timer of its own: the
     /// consensus round is bounded by the publisher's SCP timeout
     /// (`CONSENSUS_TIMEOUT`), which broadcasts `Decided(false)` and lands here
-    /// as an ordinary decision. Everything after that decision — the abort
-    /// compensation, the builder's inclusion callback — is unbounded, so an XT
+    /// as an ordinary decision. Everything after that decision (the abort
+    /// compensation, the builder's inclusion callback) is unbounded, so an XT
     /// that loses a mailbox message or a builder callback sits in
-    /// `inflight_chunks` indefinitely, and 100 such undecided XTs make
+    /// `inflight_chunks` indefinitely, and 10000 such undecided XTs make
     /// `MAX_PENDING_XTS` reject every new submission.
     ///
     /// This loop makes both visible: one `state_dump` line per tick plus one
@@ -426,7 +384,7 @@ impl DefaultCoordinator {
     /// `sendConfirm`/`sendAbort` failed. Nothing else would ever wake it: the
     /// publisher broadcasts each decision once. For an abort that means the
     /// user's escrowed tokens are waiting on a refund that will never be
-    /// retried, which is exactly how the last stress run stranded 72 accounts.
+    /// retried.
     async fn retry_unfinished_finalizations(&self) {
         // One pass under the read lock, collecting a capped retry batch and a
         // count of the ones that have exhausted their attempts. Re-queueing
@@ -532,9 +490,7 @@ impl DefaultCoordinator {
     ///
     /// Everything is collected under the read lock and formatted *after* it is
     /// released, and only [`STUCK_REPORT_LIMIT`] instances are named. The
-    /// earlier version logged one line per stuck XT while holding the lock —
-    /// 4,350 formatted lines per tick under overload — which stalled every
-    /// state mutation in the pipeline for the duration, every 10 seconds.
+    /// earlier version logged one line per stuck XT while holding the lock.
     async fn stuck_scan(&self, stuck_after: Duration) {
         struct StuckXt {
             instance_id: String,
@@ -974,7 +930,7 @@ impl DefaultCoordinator {
             xt.sender_nonces = build_sender_nonce_cache(&txs);
             xt.raw_txs = txs;
             // Pre-lock so only one local simulation task claims this XT.
-            xt.locked_chains.insert(self.chain_id);
+            //xt.locked_chains.insert(self.chain_id);
 
             state
                 .mailbox_index
@@ -1117,7 +1073,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -1168,7 +1123,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -1211,7 +1165,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         assert!(
@@ -1255,7 +1208,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         coordinator.set_chunk_sender(tx);
@@ -1302,7 +1254,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -1333,7 +1284,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -1366,7 +1316,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {
@@ -1400,7 +1349,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         let mut txs = HashMap::new();
@@ -1457,7 +1405,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
         let (tx, rx) = oneshot::channel();
 

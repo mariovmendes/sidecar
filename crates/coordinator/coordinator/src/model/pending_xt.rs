@@ -44,9 +44,6 @@ pub struct PendingXt {
     /// Votes received from peer sidecars.
     pub peer_votes: HashMap<ChainId, bool>,
 
-    /// Chains that are currently locked (being simulated).
-    pub locked_chains: HashSet<ChainId>,
-
     /// Origin chain for standalone-mode XTs.
     pub origin_chain: Option<ChainId>,
     /// Origin sequence number.
@@ -91,7 +88,6 @@ impl PendingXt {
             vote_sent: false,
             local_vote: None,
             peer_votes: HashMap::new(),
-            locked_chains: HashSet::new(),
             origin_chain: None,
             origin_seq: SequenceNumber(0),
             pending_mailbox: Vec::new(),

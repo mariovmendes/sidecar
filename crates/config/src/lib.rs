@@ -29,9 +29,6 @@ pub struct SidecarArgs {
     pub log: LogArgs,
 
     #[command(flatten)]
-    pub verification: VerificationArgs,
-
-    #[command(flatten)]
     pub mock_proof: MockProofArgs,
 }
 
@@ -184,38 +181,6 @@ pub struct LogArgs {
     pub format: String,
 }
 
-/// Inbound verification hook (per-destination rollup).
-#[derive(Debug, Clone, clap::Args)]
-pub struct VerificationArgs {
-    /// Enable the external verification hook before voting commit.
-    #[arg(
-        id = "verification_enabled",
-        long = "verification.enabled",
-        env = "SIDECAR_VERIFICATION_ENABLED",
-        default_value = "false",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        value_parser = clap::builder::BoolishValueParser::new(),
-    )]
-    pub enabled: bool,
-
-    /// Verification HTTP endpoint to call on inbound XTs.
-    #[arg(
-        long = "verification.url",
-        env = "SIDECAR_VERIFICATION_URL",
-        default_value = ""
-    )]
-    pub url: String,
-
-    /// Request timeout in milliseconds.
-    #[arg(
-        long = "verification.timeout-ms",
-        env = "SIDECAR_VERIFICATION_TIMEOUT_MS",
-        default_value = "2000"
-    )]
-    pub timeout_ms: u64,
-}
-
 /// Mock proof generation (stands in for a real op-succinct prover).
 ///
 /// When enabled, this sidecar periodically submits a fabricated-but-well-formed
@@ -270,8 +235,6 @@ mod tests {
         assert_eq!(args.chain.id, 0);
         assert_eq!(args.log.level, "info");
         assert_eq!(args.log.format, "json");
-        assert!(!args.verification.enabled);
-        assert_eq!(args.verification.url, "");
         assert!(!args.mock_proof.enabled);
         assert_eq!(args.mock_proof.interval_secs, 60);
     }

@@ -32,8 +32,6 @@ pub fn determine_xt_status(xt: &PendingXt) -> XtStatus {
         }
         return XtStatus::Simulated;
     }
-    if !xt.locked_chains.is_empty() {
-        return XtStatus::Simulating;
-    }
+
     XtStatus::Pending
 }

@@ -216,7 +216,7 @@ mod tests {
     use compose_primitives::ChainId;
     use compose_proto::MailboxMessage;
 
-    use crate::coordinator::{DefaultCoordinator, VerificationConfig};
+    use crate::coordinator::{DefaultCoordinator};
     use crate::model::pending_xt::PendingXt;
 
     #[tokio::test]
@@ -231,7 +231,6 @@ mod tests {
             None,
             None,
             1_000,
-            VerificationConfig::default(),
         );
 
         let instance_id = "xt-77777-2".to_string();
@@ -290,7 +289,6 @@ mod tests {
             None,
             None,
             1_000,
-            VerificationConfig::default(),
         );
 
         let instance_id = "xt-77777-1".to_string();

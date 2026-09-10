@@ -119,7 +119,7 @@ impl DefaultCoordinator {
 mod tests {
     use compose_primitives::ChainId;
 
-    use crate::coordinator::{ChunkStage, DefaultCoordinator, TransactionChunk, VerificationConfig};
+    use crate::coordinator::{ChunkStage, DefaultCoordinator, TransactionChunk};
     use crate::model::pending_xt::PendingXt;
 
     fn waiting_for_decided_chunk(instance_id: &str) -> TransactionChunk {
@@ -140,7 +140,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         coordinator.set_chunk_sender(tx);
@@ -199,7 +198,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         coordinator.set_chunk_sender(tx);
@@ -238,7 +236,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         coordinator.set_chunk_sender(tx);

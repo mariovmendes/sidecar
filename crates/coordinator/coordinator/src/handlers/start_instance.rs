@@ -145,12 +145,6 @@ impl DefaultCoordinator {
         xt.raw_txs = raw_txs;
         xt.sender_nonces = sender_nonces;
 
-        // TODO: Remove this as there is no more chain locking.
-        // Pre-lock so only one local simulation task claims this XT.
-        if includes_local {
-            xt.locked_chains.insert(self.chain_id);
-        }
-
         state
             .mailbox_index
             .insert(msg.instance_id.clone(), instance_id.clone());
@@ -267,7 +261,7 @@ mod tests {
     use compose_proto::{StartInstance, TransactionRequest, XtRequest};
     use tokio::sync::mpsc;
 
-    use crate::coordinator::{DefaultCoordinator, VerificationConfig};
+    use crate::coordinator::{DefaultCoordinator};
 
     fn start_instance(sequence_number: u64) -> StartInstance {
         StartInstance {
@@ -293,7 +287,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         {

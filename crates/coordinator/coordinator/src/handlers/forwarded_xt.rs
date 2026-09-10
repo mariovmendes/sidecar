@@ -59,13 +59,6 @@ impl DefaultCoordinator {
         xt.raw_txs = clean_txs;
         xt.origin_chain = Some(origin_chain);
         xt.origin_seq = origin_seq;
-
-        // Pre-lock so only one local simulation task claims this XT.
-        // TODO: Remove this pre-lock
-        if has_local {
-            xt.locked_chains.insert(self.chain_id);
-        }
-
         let raw_key = instance_id.as_bytes().to_vec();
         state.mailbox_index.insert(raw_key.clone(), xt.id.clone());
         state.pending.insert(xt.id.clone(), xt);
