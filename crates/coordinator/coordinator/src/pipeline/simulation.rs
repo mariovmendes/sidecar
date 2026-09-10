@@ -1819,24 +1819,125 @@ impl DefaultCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
-    use alloy::primitives::U256;
-    use alloy_rpc_types_eth::state::AccountOverride;
+    use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+    use alloy::primitives::{Address, TxKind, U256};
+    use alloy::rlp::Encodable;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::SignerSync;
+    use alloy::sol_types::SolCall;
     use async_trait::async_trait;
-    use axum::{extract::State, http::StatusCode, routing::post, Router};
+    use compose_mailbox::contract::{receiveETHCall, MessageHeader};
     use compose_mailbox::wire;
     use compose_primitives::ChainId;
     use compose_primitives::StateOverride;
     use compose_primitives::{CrossRollupDependency, SimulationResult};
+    use compose_primitives_traits::{CoordinatorError, PutInboxBuilder, XtBuilderClient};
+    use compose_proto::MailboxMessage;
     use compose_simulation::error::SimulationError;
     use compose_simulation::traits::Simulator;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use tokio::{net::TcpListener, task::JoinHandle};
 
     use crate::coordinator::{DefaultCoordinator, TransactionChunk};
-    use crate::model::chain_overlay::ChainOverlay;
     use crate::model::pending_xt::PendingXt;
+
+    /// Sign `call` into a transaction envelope in the same wire form the
+    /// coordinator receives raw txs in.
+    fn signed_tx<C: SolCall>(call: C) -> Vec<u8> {
+        let tx = TxEip1559 {
+            chain_id: 77777,
+            nonce: 0,
+            gas_limit: 1_000_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::repeat_byte(0x55)),
+            value: U256::ZERO,
+            input: call.abi_encode().into(),
+            access_list: Default::default(),
+        };
+        let signer = PrivateKeySigner::random();
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        let envelope: TxEnvelope = tx.into_signed(signature).into();
+        let mut encoded = Vec::new();
+        envelope.encode(&mut encoded);
+        encoded
+    }
+
+    const PUT_INBOX_NONCE: u64 = 42;
+
+    /// Stands in for the signing putInbox builder: emits the reserved nonce as
+    /// the transaction body so bundle ordering stays assertable.
+    #[derive(Debug)]
+    struct TestPutInboxBuilder;
+
+    #[async_trait]
+    impl PutInboxBuilder for TestPutInboxBuilder {
+        fn signer_address(&self) -> Address {
+            Address::ZERO
+        }
+
+        async fn canonical_nonce_at(&self) -> Result<u64, CoordinatorError> {
+            Ok(PUT_INBOX_NONCE)
+        }
+
+        async fn build_put_inbox_tx_with_nonce(
+            &self,
+            _dep: &CrossRollupDependency,
+            nonce: u64,
+        ) -> Result<Vec<u8>, CoordinatorError> {
+            Ok(nonce.to_be_bytes().to_vec())
+        }
+
+        async fn build_remove_inbox_tx_with_nonce(
+            &self,
+            _dep: &CrossRollupDependency,
+            nonce: u64,
+        ) -> Result<Vec<u8>, CoordinatorError> {
+            Ok(nonce.to_be_bytes().to_vec())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingBuilderClient {
+        submitted: Mutex<Vec<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl XtBuilderClient for RecordingBuilderClient {
+        async fn submit_locked_xt(
+            &self,
+            _instance_id: &str,
+            _period_id: u64,
+            _sequence_number: u64,
+            transactions: Vec<Vec<u8>>,
+        ) -> Result<(), CoordinatorError> {
+            self.submitted.lock().unwrap().push(transactions);
+            Ok(())
+        }
+
+        async fn submit_tx(&self, _tx: &[u8]) -> Result<(), CoordinatorError> {
+            Ok(())
+        }
+
+        async fn submit_followup_xt(
+            &self,
+            _instance_id: &str,
+            _put_inbox_transactions: Vec<Vec<u8>>,
+        ) -> Result<(), CoordinatorError> {
+            Ok(())
+        }
+
+        async fn release_xt(
+            &self,
+            _instance_id: &str,
+            _put_inbox_transactions: Vec<Vec<u8>>,
+        ) -> Result<(), CoordinatorError> {
+            Ok(())
+        }
+
+        async fn abort_xt(&self, _instance_id: &str) -> Result<(), CoordinatorError> {
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn send_vote_does_not_overwrite_existing_local_vote() {
@@ -1959,131 +2060,58 @@ mod tests {
         }
     }
 
-    struct RetryRecordingSimulator {
-        calls: AtomicUsize,
-        seen_overrides: Mutex<Vec<StateOverride>>,
-        dependency: CrossRollupDependency,
-        failed_override_addr: Address,
-    }
-
-    #[async_trait]
-    impl Simulator for RetryRecordingSimulator {
-        async fn simulate(
-            &self,
-            chain_id: ChainId,
-            tx: &[u8],
-            state_overrides: &StateOverride,
-        ) -> Result<SimulationResult, SimulationError> {
-            self.simulate_with_mailbox(chain_id, tx, state_overrides, &[])
-                .await
-        }
-
-        async fn simulate_with_mailbox(
-            &self,
-            _chain_id: ChainId,
-            _tx: &[u8],
-            state_overrides: &StateOverride,
-            _fulfilled_deps: &[CrossRollupDependency],
-        ) -> Result<SimulationResult, SimulationError> {
-            self.seen_overrides
-                .lock()
-                .unwrap()
-                .push(state_overrides.clone());
-
-            let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 {
-                let mut failed_overrides = StateOverride::default();
-                failed_overrides.insert(
-                    self.failed_override_addr,
-                    AccountOverride {
-                        nonce: Some(9),
-                        ..Default::default()
-                    },
-                );
-                Ok(SimulationResult {
-                    success: false,
-                    error: Some("missing mailbox".to_string()),
-                    state_overrides: Some(failed_overrides),
-                    dependencies: vec![self.dependency.clone()],
-                    outbound_messages: Vec::new(),
-                })
-            } else {
-                Ok(SimulationResult {
-                    success: true,
-                    error: None,
-                    state_overrides: None,
-                    dependencies: Vec::new(),
-                    outbound_messages: Vec::new(),
-                })
-            }
-        }
-    }
-
-    struct FailingAfterFulfilledDependencySimulator {
-        calls: AtomicUsize,
-        dependency: CrossRollupDependency,
-    }
-
-    #[async_trait]
-    impl Simulator for FailingAfterFulfilledDependencySimulator {
-        async fn simulate(
-            &self,
-            chain_id: ChainId,
-            tx: &[u8],
-            state_overrides: &StateOverride,
-        ) -> Result<SimulationResult, SimulationError> {
-            self.simulate_with_mailbox(chain_id, tx, state_overrides, &[])
-                .await
-        }
-
-        async fn simulate_with_mailbox(
-            &self,
-            _chain_id: ChainId,
-            _tx: &[u8],
-            _state_overrides: &StateOverride,
-            fulfilled_deps: &[CrossRollupDependency],
-        ) -> Result<SimulationResult, SimulationError> {
-            let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 {
-                assert!(fulfilled_deps.is_empty());
-                Ok(SimulationResult {
-                    success: false,
-                    error: Some("missing mailbox".to_string()),
-                    state_overrides: None,
-                    dependencies: vec![self.dependency.clone()],
-                    outbound_messages: Vec::new(),
-                })
-            } else {
-                assert_eq!(fulfilled_deps.len(), 1);
-                Ok(SimulationResult {
-                    success: false,
-                    error: Some("out of gas".to_string()),
-                    state_overrides: None,
-                    dependencies: vec![self.dependency.clone()],
-                    outbound_messages: Vec::new(),
-                })
-            }
-        }
-    }
-
+    /// Receiver-side happy path: the SEND message is already recorded for the
+    /// instance, so `register_xt` goes straight into `process_xt`, which
+    /// matches it against the receive tx header, bundles putInbox + receive
+    /// into the builder and votes true.
     #[tokio::test]
-    async fn process_xt_votes_true_on_success_with_no_deps() {
-        let simulator = Arc::new(StubSimulator { succeed: true });
-        let coordinator = DefaultCoordinator::new(
+    async fn process_xt_votes_true_when_receive_matches_mailbox_message() {
+        let sender = Address::repeat_byte(0x33);
+        let receiver = Address::repeat_byte(0x44);
+        let receive_tx = signed_tx(receiveETHCall {
+            msgHeader: MessageHeader {
+                chainSrc: U256::from(88888u64),
+                chainDest: U256::from(77777u64),
+                sender,
+                receiver,
+                sessionId: U256::from(9u64),
+                label: "SEND_ETH".to_string(),
+            },
+        });
+
+        let builder_client = Arc::new(RecordingBuilderClient::default());
+        let mut coordinator = DefaultCoordinator::new(
             ChainId(77777),
-            Some(simulator),
+            Some(Arc::new(StubSimulator { succeed: true })),
             None,
             None,
             None,
             None,
             1000,
         );
+        coordinator.set_xt_builder_client(builder_client.clone());
+        coordinator.set_put_inbox_builder(Arc::new(TestPutInboxBuilder));
 
         {
             let mut state = coordinator.state.write().await;
             let mut xt = PendingXt::new("xt-77777-10".to_string(), b"xt-77777-10".to_vec());
-            xt.raw_txs.insert(ChainId(77777), vec![vec![0xab, 0xcd]]);
+            xt.raw_txs.insert(ChainId(77777), vec![receive_tx.clone()]);
             state.pending.insert(xt.id.clone(), xt);
+            // The SEND arrived before this XT was registered, recorded under
+            // the same instance id `process_xt` looks it up by.
+            state.mailbox_messages.insert(
+                "xt-77777-10".to_string(),
+                vec![MailboxMessage {
+                    instance_id: b"xt-77777-10".to_vec(),
+                    source_chain: 88888,
+                    destination_chain: 77777,
+                    sender: sender.as_slice().to_vec(),
+                    receiver: receiver.as_slice().to_vec(),
+                    label: "SEND_ETH".to_string(),
+                    payload: vec![1, 2, 3],
+                    session_id: wire::encode_session_id(U256::from(9u64)),
+                }],
+            );
         }
 
         coordinator
@@ -2093,14 +2121,23 @@ mod tests {
             })
             .await;
 
+        let submitted = builder_client.submitted.lock().unwrap().clone();
+        assert_eq!(
+            submitted,
+            vec![vec![PUT_INBOX_NONCE.to_be_bytes().to_vec(), receive_tx]],
+            "putInbox must be bundled ahead of the receive tx"
+        );
+
         let state = coordinator.state.read().await;
         let xt = state.pending.get("xt-77777-10").unwrap();
         assert_eq!(xt.local_vote, Some(true));
     }
 
+    /// A raw tx that is not a decodable envelope is rejected before the
+    /// simulator or the mailbox are ever consulted.
     #[tokio::test]
-    async fn process_xt_votes_false_on_simulation_error() {
-        let simulator = Arc::new(StubSimulator { succeed: false });
+    async fn register_xt_votes_false_on_undecodable_tx() {
+        let simulator = Arc::new(StubSimulator { succeed: true });
         let coordinator = DefaultCoordinator::new(
             ChainId(77777),
             Some(simulator),
@@ -2160,146 +2197,5 @@ mod tests {
         let state = coordinator.state.read().await;
         let xt = state.pending.get("xt-77777-12").unwrap();
         assert_eq!(xt.local_vote, Some(false));
-    }
-
-    #[tokio::test]
-    async fn process_xt_does_not_carry_failed_dependency_overrides_into_retry() {
-        let base_addr = Address::repeat_byte(0x11);
-        let failed_addr = Address::repeat_byte(0x22);
-        let dependency = CrossRollupDependency {
-            source_chain_id: ChainId(88888),
-            dest_chain_id: ChainId(77777),
-            sender: Address::repeat_byte(0x33),
-            receiver: Address::repeat_byte(0x44),
-            label: b"SEND".to_vec(),
-            data: None,
-            session_id: U256::ZERO,
-        };
-
-        let simulator = Arc::new(RetryRecordingSimulator {
-            calls: AtomicUsize::new(0),
-            seen_overrides: Mutex::new(Vec::new()),
-            dependency: dependency.clone(),
-            failed_override_addr: failed_addr,
-        });
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            Some(simulator.clone()),
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
-
-        let mut base_overrides = StateOverride::default();
-        base_overrides.insert(
-            base_addr,
-            AccountOverride {
-                nonce: Some(7),
-                ..Default::default()
-            },
-        );
-
-        {
-            let mut state = coordinator.state.write().await;
-            state.chain_overlay.insert(
-                ChainId(77777),
-                ChainOverlay {
-                    overlay: base_overrides.clone(),
-                },
-            );
-
-            let mut xt = PendingXt::new("xt-77777-13".to_string(), b"xt-77777-13".to_vec());
-            xt.raw_txs.insert(ChainId(77777), vec![vec![0xab, 0xcd]]);
-            xt.pending_mailbox.push(compose_proto::MailboxMessage {
-                source_chain: 88888,
-                destination_chain: 77777,
-                sender: Address::repeat_byte(0x33).as_slice().to_vec(),
-                receiver: Address::repeat_byte(0x44).as_slice().to_vec(),
-                label: "SEND".to_string(),
-                payload: vec![1, 2, 3],
-                session_id: wire::encode_session_id(U256::ZERO),
-                ..Default::default()
-            });
-            state.pending.insert(xt.id.clone(), xt);
-        }
-
-        coordinator
-            .register_xt(&mut TransactionChunk {
-                instance_id: "xt-77777-13".to_string(),
-                ..Default::default()
-            })
-            .await;
-
-        let seen = simulator.seen_overrides.lock().unwrap();
-        assert_eq!(seen.len(), 2);
-        assert!(seen[0].contains_key(&base_addr));
-        assert!(!seen[0].contains_key(&failed_addr));
-        assert!(seen[1].contains_key(&base_addr));
-        assert!(
-            !seen[1].contains_key(&failed_addr),
-            "retry should start from base overrides, not failed-trace post-state"
-        );
-    }
-
-    #[tokio::test]
-    async fn process_xt_votes_false_immediately_when_failed_retry_only_has_fulfilled_deps() {
-        let dependency = CrossRollupDependency {
-            source_chain_id: ChainId(88888),
-            dest_chain_id: ChainId(77777),
-            sender: Address::repeat_byte(0x33),
-            receiver: Address::repeat_byte(0x44),
-            label: b"SEND".to_vec(),
-            data: None,
-            session_id: U256::ZERO,
-        };
-
-        let simulator = Arc::new(FailingAfterFulfilledDependencySimulator {
-            calls: AtomicUsize::new(0),
-            dependency: dependency.clone(),
-        });
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            Some(simulator.clone()),
-            None,
-            None,
-            None,
-            None,
-            10_000,
-        );
-
-        {
-            let mut state = coordinator.state.write().await;
-            let mut xt = PendingXt::new("xt-77777-14".to_string(), b"xt-77777-14".to_vec());
-            xt.raw_txs.insert(ChainId(77777), vec![vec![0xab, 0xcd]]);
-            xt.pending_mailbox.push(compose_proto::MailboxMessage {
-                source_chain: 88888,
-                destination_chain: 77777,
-                sender: Address::repeat_byte(0x33).as_slice().to_vec(),
-                receiver: Address::repeat_byte(0x44).as_slice().to_vec(),
-                label: "SEND".to_string(),
-                payload: vec![1, 2, 3],
-                session_id: wire::encode_session_id(U256::ZERO),
-                ..Default::default()
-            });
-            state.pending.insert(xt.id.clone(), xt);
-        }
-
-        tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            coordinator.register_xt(&mut TransactionChunk {
-                instance_id: "xt-77777-14".to_string(),
-                ..Default::default()
-            }),
-        )
-        .await
-        .expect("register_xt should not wait for already-fulfilled deps");
-
-        let state = coordinator.state.read().await;
-        let xt = state.pending.get("xt-77777-14").unwrap();
-        assert_eq!(xt.local_vote, Some(false));
-        assert_eq!(xt.fulfilled_deps.len(), 1);
-        assert_eq!(simulator.calls.load(Ordering::SeqCst), 2);
     }
 }

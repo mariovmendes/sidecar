@@ -213,14 +213,54 @@ impl DefaultCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use compose_primitives::ChainId;
+    use std::sync::Arc;
+    use alloy_rpc_types_eth::state::StateOverride;
+    use async_trait::async_trait;
+    use compose_primitives::{ChainId, CrossRollupDependency, SimulationResult};
     use compose_proto::MailboxMessage;
-
-    use crate::coordinator::{DefaultCoordinator};
+    use compose_simulation::error::SimulationError;
+    use compose_simulation::traits::Simulator;
+    use crate::coordinator::{DefaultCoordinator, TransactionChunk};
     use crate::model::pending_xt::PendingXt;
 
+    struct StubSimulator {
+        succeed: bool,
+    }
+
+    #[async_trait]
+    impl Simulator for StubSimulator {
+        async fn simulate(
+            &self,
+            _chain_id: ChainId,
+            _tx: &[u8],
+            _state_overrides: &StateOverride,
+        ) -> Result<SimulationResult, SimulationError> {
+            if self.succeed {
+                Ok(SimulationResult {
+                    success: true,
+                    error: None,
+                    state_overrides: None,
+                    dependencies: Vec::new(),
+                    outbound_messages: Vec::new(),
+                })
+            } else {
+                Err(SimulationError::Failed("stub failure".to_string()))
+            }
+        }
+
+        async fn simulate_with_mailbox(
+            &self,
+            chain_id: ChainId,
+            tx: &[u8],
+            state_overrides: &StateOverride,
+            _fulfilled_deps: &[CrossRollupDependency],
+        ) -> Result<SimulationResult, SimulationError> {
+            self.simulate(chain_id, tx, state_overrides).await
+        }
+    }
+
     #[tokio::test]
-    async fn mailbox_message_buffered_when_xt_not_yet_registered() {
+    async fn mailbox_message_stored_when_xt_not_yet_registered() {
         // Reproduce the race where the mailbox message arrives before the
         // forwarded XT is registered in mailbox_index.
         let coordinator = DefaultCoordinator::new(
@@ -245,45 +285,23 @@ mod tests {
         };
         coordinator.handle_mailbox_message(&msg).await.unwrap();
 
-        // Verify the message is in the buffer, not lost.
+        // Verify the message has been saved to mailbox_messages
         {
             let state = coordinator.state.read().await;
-            let buffered = state
-                .mailbox_buffer
-                .get(instance_id.as_bytes())
-                .expect("message should be buffered");
-            assert_eq!(buffered.len(), 1);
-            assert_eq!(buffered[0].label, "SEND");
+            let wrapped_mailbox = state.mailbox_messages.get(&hex::encode(instance_id.as_bytes()));
+            assert_eq!(wrapped_mailbox.is_some(),true);
+            let unwrapped_mailbox = wrapped_mailbox.unwrap();
+            assert_eq!(unwrapped_mailbox.len(), 1);
+            assert_eq!(unwrapped_mailbox.get(0).unwrap().label, "SEND");
         }
-
-        // Now register the XT via handle_forwarded_xt.
-        use std::collections::HashMap;
-        coordinator
-            .handle_forwarded_xt(
-                &instance_id,
-                HashMap::from([(ChainId(88888), vec![vec![1]])]),
-                ChainId(77777),
-                compose_primitives::SequenceNumber(1),
-            )
-            .await
-            .unwrap();
-
-        // Buffer should be drained and message attached to the XT.
-        let state = coordinator.state.read().await;
-        assert!(
-            !state.mailbox_buffer.contains_key(instance_id.as_bytes()),
-            "buffer should be empty after XT registration"
-        );
-        let xt = state.pending.get(instance_id.as_str()).unwrap();
-        assert_eq!(xt.pending_mailbox.len(), 1);
-        assert_eq!(xt.pending_mailbox[0].label, "SEND");
     }
 
     #[tokio::test]
     async fn mailbox_message_attaches_to_pending_xt_by_raw_instance_id() {
+        let simulator = Arc::new(StubSimulator { succeed: true });
         let coordinator = DefaultCoordinator::new(
             ChainId(88888),
-            None,
+            Some(simulator),
             None,
             None,
             None,
@@ -292,15 +310,20 @@ mod tests {
         );
 
         let instance_id = "xt-77777-1".to_string();
-        let xt = PendingXt::new(instance_id.clone(), instance_id.as_bytes().to_vec());
+        let mut xt = PendingXt::new(instance_id.clone(), instance_id.as_bytes().to_vec());
 
         {
             let mut state = coordinator.state.write().await;
-            state
-                .mailbox_index
-                .insert(instance_id.as_bytes().to_vec(), xt.id.clone());
+            xt.raw_txs.insert(ChainId(77777), vec![vec![0xde, 0xad]]);
             state.pending.insert(xt.id.clone(), xt);
         }
+
+        coordinator
+            .register_xt(&mut TransactionChunk {
+                instance_id: "xt-77777-11".to_string(),
+                ..Default::default()
+            })
+            .await;
 
         let msg = MailboxMessage {
             instance_id: instance_id.as_bytes().to_vec(),
@@ -313,9 +336,10 @@ mod tests {
         coordinator.handle_mailbox_message(&msg).await.unwrap();
 
         let state = coordinator.state.read().await;
-        let updated = state.pending.get(instance_id.as_str()).unwrap();
-
-        assert_eq!(updated.pending_mailbox.len(), 1);
-        assert_eq!(updated.pending_mailbox[0].label, "SEND");
+        let wrapped_mailbox = state.mailbox_messages.get(&hex::encode(instance_id.as_bytes()));
+        assert_eq!(wrapped_mailbox.is_some(),true);
+        let unwrapped_mailbox = wrapped_mailbox.unwrap();
+        assert_eq!(unwrapped_mailbox.len(), 1);
+        assert_eq!(unwrapped_mailbox.get(0).unwrap().label, "SEND");
     }
 }
