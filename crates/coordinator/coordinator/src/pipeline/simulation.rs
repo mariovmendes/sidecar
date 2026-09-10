@@ -5,7 +5,6 @@ use crate::coordinator::ChunkStage::{
 };
 use crate::coordinator::{ChunkStage, DefaultCoordinator, TransactionChunk};
 use crate::pipeline::delivery::{decode_sender_nonce, describe_local_txs};
-use compose_primitives::xtflow;
 use alloy::consensus::{Transaction, TxEnvelope};
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::{SolCall, SolValue};
@@ -16,6 +15,7 @@ use compose_mailbox::contract::{
 use compose_mailbox::matching::matches_dependency;
 use compose_mailbox::overrides::merge_overrides;
 use compose_mailbox::wire;
+use compose_primitives::xtflow;
 use compose_primitives::{ChainId, CrossRollupDependency, StateOverride};
 use compose_primitives_traits::{SendAbortEthParams, SendAbortTokenParams};
 use compose_proto::MailboxMessage;
@@ -150,7 +150,7 @@ impl DefaultCoordinator {
 
         // Re-validate under the write lock: the XT may have been rolled back
         // between the read lock above and here.
-        let received_message_xt = {
+        {
             let state = self.state.write().await;
             if !state
                 .pending
@@ -160,13 +160,8 @@ impl DefaultCoordinator {
                     transaction_chunk.instance_id,
                     "XT disappeared during simulation (likely rollback)"
                 );
-                drop(state);
                 return;
             }
-
-            state
-                .mailbox_messages
-                .contains_key(&transaction_chunk.instance_id)
         };
 
         // Process each transaction.
@@ -224,15 +219,25 @@ impl DefaultCoordinator {
 
         transaction_chunk.confirmed_stage = Some(Registered);
         transaction_chunk.stage = WaitingForMessages;
-        {
+        let mut roles: Vec<&String> = transaction_chunk.organised_transactions.keys().collect();
+        roles.sort();
+
+        // Publishing the chunk and checking for an already-arrived message must
+        // happen under one lock: handle_mailbox_message records the message and
+        // looks for the chunk under a single write lock too, so with these split
+        // a message landing in between is seen by neither side and the chunk
+        // parks at WaitingForMessages forever.
+        let received_message_xt = {
             let mut state = self.state.write().await;
             state.inflight_chunks.insert(
                 transaction_chunk.instance_id.clone(),
                 transaction_chunk.clone(),
             );
-        }
-        let mut roles: Vec<&String> = transaction_chunk.organised_transactions.keys().collect();
-        roles.sort();
+            state
+                .mailbox_messages
+                .contains_key(&transaction_chunk.instance_id)
+        };
+
         xtflow!(
             "stage",
             instance_id = transaction_chunk.instance_id,
@@ -1140,7 +1145,8 @@ impl DefaultCoordinator {
                         error = e,
                     );
                     warn!(transaction_chunk.instance_id, error = %e, "Failed to submit sendConfirm");
-                    self.note_finalize_failure(transaction_chunk, "sendConfirm").await;
+                    self.note_finalize_failure(transaction_chunk, "sendConfirm")
+                        .await;
                     return;
                 }
 
@@ -1200,7 +1206,8 @@ impl DefaultCoordinator {
                         error = e,
                     );
                     warn!(transaction_chunk.instance_id, error = %e, "Failed to submit recvConfirm");
-                    self.note_finalize_failure(transaction_chunk, "recvConfirm").await;
+                    self.note_finalize_failure(transaction_chunk, "recvConfirm")
+                        .await;
                     return;
                 }
 
@@ -1264,7 +1271,8 @@ impl DefaultCoordinator {
                 // with no refund in flight, so leave `confirmed_stage` behind
                 // and let the watchdog retry.
                 if let Compensation::Failed = outcome {
-                    self.note_finalize_failure(transaction_chunk, "sendAbort").await;
+                    self.note_finalize_failure(transaction_chunk, "sendAbort")
+                        .await;
                     return;
                 }
 
@@ -1941,15 +1949,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_vote_does_not_overwrite_existing_local_vote() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -1967,15 +1968,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_vote_decides_when_peer_vote_already_present() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -1996,15 +1990,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_vote_applies_existing_abort_peer_vote() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -2169,15 +2156,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_xt_votes_false_when_no_local_txs() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
