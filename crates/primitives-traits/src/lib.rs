@@ -7,12 +7,14 @@
 
 pub mod builder_control;
 pub mod error;
+pub mod l2_bridge;
 pub mod mailbox;
 pub mod publisher;
 pub mod put_inbox;
 
 pub use builder_control::XtBuilderClient;
 pub use error::CoordinatorError;
+pub use l2_bridge::{L2BridgeTxBuilder, SendAbortEthParams, SendAbortTokenParams};
 pub use mailbox::MailboxSender;
 pub use publisher::PublisherClient;
 pub use put_inbox::PutInboxBuilder;

@@ -1,24 +1,26 @@
 //! Start-instance handling and sequencing validation.
 
-use std::collections::HashMap;
-
 use compose_primitives::{ChainId, InstanceId, PeriodId, SequenceNumber};
 use compose_proto::StartInstance;
+use std::collections::HashMap;
+use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info, warn};
 
-use crate::coordinator::DefaultCoordinator;
+use crate::coordinator::{DefaultCoordinator, MAX_PENDING_XTS};
 use crate::model::pending_xt::PendingXt;
-use crate::pipeline::delivery::build_sender_nonce_cache;
+use crate::pipeline::delivery::{build_sender_nonce_cache, describe_txs};
 use crate::pipeline::submission::xt_request_fingerprint;
+use compose_primitives::xtflow;
 use compose_primitives_traits::CoordinatorError;
-
-/// Maximum number of pending XTs before new submissions are rejected.
-const MAX_PENDING_XTS: usize = 100;
 
 impl DefaultCoordinator {
     /// Process a new instance from the publisher. Validates the period and
     /// sequence, decodes transactions, and registers the XT.
-    pub async fn handle_start_instance(&self, msg: &StartInstance) -> Result<(), CoordinatorError> {
+    pub async fn handle_start_instance(
+        &self,
+        msg: &StartInstance,
+        sender: &Sender<String>,
+    ) -> Result<(), CoordinatorError> {
         let instance_id = InstanceId::from_publisher_bytes(&msg.instance_id);
         let xt_request = msg
             .xt_request
@@ -50,9 +52,16 @@ impl DefaultCoordinator {
         let mut state = self.state.write().await;
 
         if state.pending.contains_key(&instance_id) {
-            return Err(CoordinatorError::InstanceAlreadyPending(
-                instance_id.to_string(),
-            ));
+            // A re-submission of a byte-identical XT parks a fresh waiter on the
+            // same fingerprint, so a replayed or retransmitted start-instance can
+            // land here with someone still listening. Answering keeps it in line
+            // with every other early return below; staying silent would cost that
+            // caller the full submission timeout.
+            drop(state);
+            let error = CoordinatorError::InstanceAlreadyPending(instance_id.to_string());
+            self.resolve_pending_submission(&fingerprint, Err(error.to_string()))
+                .await;
+            return Err(error);
         }
 
         let undecided_count = state
@@ -62,6 +71,13 @@ impl DefaultCoordinator {
             .count();
         if undecided_count >= MAX_PENDING_XTS {
             let error = CoordinatorError::TooManyPendingInstances(MAX_PENDING_XTS).to_string();
+            xtflow!(
+                "backpressure",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                undecided = undecided_count,
+                max_pending = MAX_PENDING_XTS,
+            );
             drop(state);
             self.resolve_pending_submission(&fingerprint, Err(error))
                 .await;
@@ -114,31 +130,25 @@ impl DefaultCoordinator {
             return Ok(());
         }
 
+        // Out-of-order arrival is not an error. The publisher assigns sequence
+        // numbers in order, but each message reaches us on its own QUIC stream
+        // (`open_uni`/`accept_uni`), and QUIC only orders *within* a stream —
+        // so a strictly-increasing arrival check rejects perfectly valid
+        // instances as soon as more than one submitter is active.
+        //
+        // Nothing downstream needs arrival order either: the builder keys its
+        // executable set on `XtOrderKey { period_id, sequence_number }`
+        // (`ordered_instances`), so an instance that arrives late is still
+        // executed in its assigned position. Duplicates are the only thing
+        // worth refusing, and the `pending` check above already does that.
         let msg_seq = SequenceNumber(msg.sequence_number);
-        if msg_seq <= state.last_sequence_num {
-            drop(state);
-            self.resolve_pending_submission(
-                &fingerprint,
-                Err(CoordinatorError::StaleSequence.to_string()),
-            )
-            .await;
-            warn!(instance_id = %instance_id, "Stale sequence, rejecting");
-            self.reject_start_instance(&instance_id, msg).await;
-            return Ok(());
-        }
-
-        state.last_sequence_num = msg_seq;
+        state.last_sequence_num = state.last_sequence_num.max(msg_seq);
 
         let mut xt = PendingXt::new(instance_id.to_string(), msg.instance_id.clone());
         xt.period_id = msg_period;
         xt.sequence_num = msg_seq;
         xt.raw_txs = raw_txs;
         xt.sender_nonces = sender_nonces;
-
-        // Pre-lock so only one local simulation task claims this XT.
-        if includes_local {
-            xt.locked_chains.insert(self.chain_id);
-        }
 
         state
             .mailbox_index
@@ -158,6 +168,16 @@ impl DefaultCoordinator {
             }
         }
 
+        xtflow!(
+            "start_instance",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            period = msg.period_id,
+            seq = msg.sequence_number,
+            chains = state.pending[&instance_id].raw_txs.len(),
+            includes_local = includes_local,
+            txs = describe_txs(&state.pending[&instance_id].raw_txs),
+        );
         info!(
             instance_id = %instance_id,
             period_id = msg.period_id,
@@ -171,13 +191,14 @@ impl DefaultCoordinator {
             m.xt_pending_count.inc();
         }
 
+        // Release the write lock before spawning so register_xt can acquire it.
+        drop(state);
+
+        /*
         let local_submission = state
             .pending
             .get(&instance_id)
             .and_then(|xt| self.local_builder_submission(xt));
-
-        // Release the write lock before spawning so process_xt can acquire it.
-        drop(state);
 
         if let Some(submission) = local_submission {
             if let Err(err) = self.submit_xt_to_builder(submission).await {
@@ -187,23 +208,49 @@ impl DefaultCoordinator {
                 self.reject_start_instance(&instance_id, msg).await;
                 return Err(err);
             }
-        }
+        }*/
 
         self.resolve_pending_submission(&fingerprint, Ok(instance_id.clone()))
             .await;
 
         if includes_local {
-            let coordinator = self.clone();
-            let id = instance_id.clone();
-            self.task_tracker.spawn(async move {
-                coordinator.process_xt(&id).await;
-            });
+            let id = instance_id.to_string();
+            if let Err(e) = sender.send(id.clone()).await {
+                xtflow!(
+                    "signal_failed",
+                    instance_id = id,
+                    chain = self.chain_id,
+                    error = e
+                );
+                error!(error = %e, instance_id = %id, "Failed to enqueue new instance, skipping XT processing");
+            } else {
+                xtflow!(
+                    "signal_enqueued",
+                    instance_id = id,
+                    chain = self.chain_id,
+                    from = "start_instance"
+                );
+                info!(instance_id = %id, "New instance signalled to chunk processor");
+            }
+        } else {
+            xtflow!(
+                "not_local",
+                instance_id = instance_id,
+                chain = self.chain_id
+            );
         }
 
         Ok(())
     }
 
     async fn reject_start_instance(&self, instance_id: &str, msg: &StartInstance) {
+        xtflow!(
+            "start_instance_rejected",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            period = msg.period_id,
+            seq = msg.sequence_number,
+        );
         warn!(
             instance_id,
             period_id = msg.period_id,
@@ -231,8 +278,11 @@ impl DefaultCoordinator {
 mod tests {
     use compose_primitives::{ChainId, PeriodId};
     use compose_proto::{StartInstance, TransactionRequest, XtRequest};
+    use tokio::sync::mpsc;
 
-    use crate::coordinator::{DefaultCoordinator, VerificationConfig};
+    use crate::coordinator::DefaultCoordinator;
+    use crate::pipeline::submission::xt_request_fingerprint;
+    use compose_primitives_traits::CoordinatorError;
 
     fn start_instance(sequence_number: u64) -> StartInstance {
         StartInstance {
@@ -250,16 +300,8 @@ mod tests {
 
     #[tokio::test]
     async fn handle_start_instance_allows_multiple_local_xts() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-            VerificationConfig::default(),
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -267,17 +309,58 @@ mod tests {
             state.current_period_id = PeriodId(1);
         }
 
+        let (tx, _rx) = mpsc::channel::<String>(300);
+
         coordinator
-            .handle_start_instance(&start_instance(1))
+            .handle_start_instance(&start_instance(1), &tx)
             .await
             .unwrap();
         coordinator
-            .handle_start_instance(&start_instance(2))
+            .handle_start_instance(&start_instance(2), &tx)
             .await
             .unwrap();
 
         let state = coordinator.state.read().await;
         assert_eq!(state.pending.len(), 2);
         assert_eq!(state.last_sequence_num.0, 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_instance_answers_a_parked_submitter() {
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
+
+        {
+            let mut state = coordinator.state.write().await;
+            state.period_initialized = true;
+            state.current_period_id = PeriodId(1);
+        }
+
+        let (tx, _rx) = mpsc::channel::<String>(300);
+        let msg = start_instance(1);
+        coordinator.handle_start_instance(&msg, &tx).await.unwrap();
+
+        // A re-submission of the identical XT parks a waiter on the same
+        // fingerprint after the first one was already resolved and removed.
+        let (waiter, mut parked) = tokio::sync::oneshot::channel();
+        let fingerprint = xt_request_fingerprint(msg.xt_request.as_ref().unwrap());
+        coordinator
+            .state
+            .write()
+            .await
+            .pending_submissions
+            .insert(fingerprint, vec![waiter]);
+
+        // The publisher replays the instance we already hold.
+        let err = coordinator
+            .handle_start_instance(&msg, &tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::InstanceAlreadyPending(_)));
+
+        // Answered immediately rather than left to hit the submission timeout.
+        // `try_recv` rather than `await`: unresolved, the sender stays alive in
+        // state and awaiting would hang instead of failing.
+        assert!(parked.try_recv().unwrap().is_err());
     }
 }

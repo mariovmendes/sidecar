@@ -46,7 +46,6 @@ This is an active implementation of the Ethera protocol. It currently covers:
   (`ethera_submitXt` to lock a slot, `ethera_releaseXt` to deliver `putInbox` + main txs,
   `ethera_abortXt` to release on abort) with deferred nonce management for concurrent
   `putInbox` transactions. Inclusion is reported back over `POST /ethera/confirm`.
-- **Verification hook**: optional external HTTP callout on inbound XTs before the commit vote.
 
 ---
 
@@ -98,7 +97,6 @@ Key configuration groups:
 | `SIDECAR_UNIVERSAL_BRIDGE_MAILBOX_ADDRESS` | UniversalBridgeMailbox contract address                   |
 | `SIDECAR_PUBLISHER_*`                      | SP QUIC endpoint and reconnection policy                  |
 | `SIDECAR_PEERS`                            | Comma-delimited peer map: `CHAIN_ID=URL[,CHAIN_ID=URL]`   |
-| `SIDECAR_VERIFICATION_*`                   | External verification hook for inbound XTs                |
 | `SIDECAR_LOG_*`                            | Log level (`debug`/`info`/…) and format (`json`/`pretty`) |
 
 ## Testing

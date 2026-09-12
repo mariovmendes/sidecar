@@ -29,7 +29,7 @@ pub struct SidecarArgs {
     pub log: LogArgs,
 
     #[command(flatten)]
-    pub verification: VerificationArgs,
+    pub mock_proof: MockProofArgs,
 }
 
 /// HTTP server settings.
@@ -132,6 +132,14 @@ pub struct ChainArgs {
     )]
     pub universal_bridge_mailbox_address: String,
 
+    /// `ComposeL2ToL2Bridge` contract address.
+    #[arg(
+        long = "chain.l2-bridge-address",
+        env = "SIDECAR_L2_BRIDGE_ADDRESS",
+        default_value = ""
+    )]
+    pub l2_bridge_address: String,
+
     /// Private key for signing local `putInbox` transactions.
     #[arg(
         long = "chain.coordinator-key",
@@ -173,14 +181,22 @@ pub struct LogArgs {
     pub format: String,
 }
 
-/// Inbound verification hook (per-destination rollup).
+/// Mock proof generation (stands in for a real op-succinct prover).
+///
+/// When enabled, this sidecar periodically submits a fabricated-but-well-formed
+/// proof for its own chain to the publisher's `/v1/proofs/op-succinct` HTTP
+/// endpoint, so the publisher's proof-collection window can be satisfied
+/// without running a real ZK prover. Pairs with a `MockVerifier` deployed on
+/// L1 (which accepts any proof unconditionally) so the full pipeline —
+/// including the L1 submission — can be exercised end-to-end in local
+/// testing.
 #[derive(Debug, Clone, clap::Args)]
-pub struct VerificationArgs {
-    /// Enable the external verification hook before voting commit.
+pub struct MockProofArgs {
+    /// Enable mock proof submission.
     #[arg(
-        id = "verification_enabled",
-        long = "verification.enabled",
-        env = "SIDECAR_VERIFICATION_ENABLED",
+        id = "mock_proof_enabled",
+        long = "mock-proof.enabled",
+        env = "SIDECAR_MOCK_PROOF_ENABLED",
         default_value = "false",
         num_args = 0..=1,
         default_missing_value = "true",
@@ -188,21 +204,23 @@ pub struct VerificationArgs {
     )]
     pub enabled: bool,
 
-    /// Verification HTTP endpoint to call on inbound XTs.
+    /// Publisher HTTP API address (host:port) to submit mock proofs to.
     #[arg(
-        long = "verification.url",
-        env = "SIDECAR_VERIFICATION_URL",
+        long = "mock-proof.publisher-http-addr",
+        env = "SIDECAR_MOCK_PROOF_PUBLISHER_HTTP_ADDR",
         default_value = ""
     )]
-    pub url: String,
+    pub publisher_http_addr: String,
 
-    /// Request timeout in milliseconds.
+    /// Interval between mock proof submissions, in seconds. Should be <= the
+    /// publisher's consensus period duration so a proof is always ready
+    /// before the next period's collection window closes.
     #[arg(
-        long = "verification.timeout-ms",
-        env = "SIDECAR_VERIFICATION_TIMEOUT_MS",
-        default_value = "2000"
+        long = "mock-proof.interval-secs",
+        env = "SIDECAR_MOCK_PROOF_INTERVAL_SECS",
+        default_value = "60"
     )]
-    pub timeout_ms: u64,
+    pub interval_secs: u64,
 }
 
 #[cfg(test)]
@@ -217,8 +235,8 @@ mod tests {
         assert_eq!(args.chain.id, 0);
         assert_eq!(args.log.level, "info");
         assert_eq!(args.log.format, "json");
-        assert!(!args.verification.enabled);
-        assert_eq!(args.verification.url, "");
+        assert!(!args.mock_proof.enabled);
+        assert_eq!(args.mock_proof.interval_secs, 60);
     }
 
     #[test]

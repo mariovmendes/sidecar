@@ -1,18 +1,22 @@
 //! Sidecar binary entrypoint.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use compose_config::SidecarArgs;
+use compose_config::{MockProofArgs, SidecarArgs};
 use compose_coordinator::builder::CoordinatorBuilder;
 use compose_coordinator::builder_client::HttpXtBuilderClient;
-use compose_coordinator::coordinator::{DefaultCoordinator, VerificationConfig};
+use compose_coordinator::coordinator::{DefaultCoordinator, TransactionChunk};
+use compose_coordinator::coordinator::ChunkStage::*;
+use compose_mailbox::l2_bridge::L2BridgeContractTxBuilder;
 use compose_mailbox::put_inbox::PutInboxTxBuilder;
 use compose_mailbox::queue::InMemoryQueue;
 use compose_metrics::SidecarMetrics;
 use compose_peer::coordinator::{HttpPeerCoordinator, PeerEntry as RuntimePeerEntry};
+use compose_primitives::xtflow;
 use compose_peer::sender::PeerMailboxSender;
 use compose_publisher::PublisherConnection;
 use compose_server::handlers::publisher::handle_publisher_message;
@@ -26,6 +30,18 @@ use compose_transport::traits::Transport;
 use prometheus_client::registry::Registry;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::{Receiver, Sender};
+use compose_coordinator::coordinator::ChunkStage::{Aborted, Registered};
+
+/// Depth of the internal work queues (publisher messages, chunk signals).
+///
+/// Deliberately far larger than any backlog a run should produce: a full queue
+/// makes `send().await` block its producer, which for the publisher consumer
+/// means stalling the whole control-plane connection. Sized to never be the
+/// thing that pushes back, so real throughput limits show up as a growing
+/// `dispatch_done … queued=` instead of as a stall.
+const CHANNEL_CAPACITY: usize = 3_000_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,14 +54,27 @@ async fn main() -> Result<()> {
     let mut registry = Registry::default();
     let metrics = Arc::new(SidecarMetrics::new(&mut registry));
 
-    let (coordinator, quic_client) = build_coordinator(&args, metrics)?;
+    let (mut coordinator, quic_client) = build_coordinator(&args, metrics)?;
+
+    // The chunk sender must be attached *before* `start()`: that spawns the
+    // cleanup and watchdog tasks from a clone of the coordinator, and
+    // `chunk_sender` is a plain field, so anything set afterwards is invisible
+    // to them. With the order reversed the watchdog could log its finalization
+    // retries but never enqueue them.
+    let (tx, rx) = mpsc::channel::<String>(CHANNEL_CAPACITY);
+    coordinator.set_chunk_sender(tx.clone());
 
     coordinator.start().await?;
 
     let coordinator_arc = Arc::new(coordinator);
 
     if let Some(client) = quic_client {
-        spawn_publisher_connection(coordinator_arc.clone(), client);
+        spawn_publisher_connection(coordinator_arc.clone(), client, tx.clone());
+        spawn_chunk_processor(coordinator_arc.clone(), rx);
+    }
+
+    if args.mock_proof.enabled {
+        spawn_mock_proof_submitter(args.chain.id, args.mock_proof.clone());
     }
 
     let state = AppState::from_arc(coordinator_arc).with_registry(registry);
@@ -87,6 +116,7 @@ fn build_coordinator(
     let has_mailbox = !universal_bridge_mailbox_address.is_empty();
     let has_key = !args.chain.coordinator_key.is_empty();
     if has_rpc && has_mailbox && has_key {
+        //TODO: Configure also removeInbox and check the universal if it is the same as the one developed
         match PutInboxTxBuilder::new(
             chain_id,
             chain_rpc.to_string(),
@@ -109,6 +139,31 @@ fn build_coordinator(
         );
     }
 
+    let l2_bridge_address = &args.chain.l2_bridge_address;
+    let has_l2_bridge = !l2_bridge_address.is_empty();
+    if has_rpc && has_l2_bridge && has_key {
+        match L2BridgeContractTxBuilder::new(
+            chain_id.0,
+            chain_rpc.to_string(),
+            l2_bridge_address.clone(),
+            args.chain.coordinator_key.clone(),
+        ) {
+            Ok(l2_bridge) => {
+                builder = builder.l2_bridge_builder(Arc::new(l2_bridge));
+            }
+            Err(e) => {
+                warn!(error = %e, endpoint = chain_rpc, "Failed to configure l2 bridge builder");
+            }
+        }
+    } else if has_l2_bridge || has_key {
+        warn!(
+            has_rpc,
+            has_l2_bridge,
+            has_coordinator_key = has_key,
+            "l2 bridge builder disabled due to incomplete chain config"
+        );
+    }
+
     if !builder_rpc.is_empty() {
         let rpc_chains = vec![ChainRpcConfig {
             chain_id,
@@ -124,12 +179,6 @@ fn build_coordinator(
     }
 
     builder = builder.mailbox_queue(Arc::new(InMemoryQueue::new()));
-
-    builder = builder.verification_config(VerificationConfig {
-        enabled: args.verification.enabled,
-        url: args.verification.url.clone(),
-        timeout_ms: args.verification.timeout_ms,
-    });
 
     let peer_entries = args.peers.entries()?;
     if !peer_entries.is_empty() {
@@ -181,7 +230,19 @@ fn build_coordinator(
     Ok((builder.build()?, quic_client))
 }
 
-fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<QuicClient>) {
+fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<QuicClient>, tx: Sender<String>) {
+    // Publisher messages are processed by a single consumer, in arrival order.
+    //
+    // Spawning a task per message let them race: `handle_start_instance`
+    // requires strictly increasing sequence numbers and `handle_start_period`
+    // moves the period, so whichever task lost the race for the state lock was
+    // rejected as "stale sequence"/"stale period". Rare at 10 XT/s, constant
+    // once several submitters run in parallel.
+    //
+    // The reader stays a separate task so a slow handler never stops draining
+    // the socket.
+    let (msg_tx, mut msg_rx) = mpsc::channel(CHANNEL_CAPACITY);
+
     tokio::spawn(async move {
         info!("Connecting to publisher");
         if let Err(e) = client.connect_with_retry().await {
@@ -193,10 +254,10 @@ fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<
         loop {
             match client.recv().await {
                 Ok(data) => {
-                    let coord = coordinator.clone();
-                    tokio::spawn(async move {
-                        handle_publisher_message(coord, data).await;
-                    });
+                    if msg_tx.send(data).await.is_err() {
+                        warn!("Publisher message consumer gone, stopping receive loop");
+                        break;
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "Publisher receive error, connection may be lost");
@@ -206,6 +267,187 @@ fn spawn_publisher_connection(coordinator: Arc<DefaultCoordinator>, client: Arc<
         }
 
         warn!("Publisher receive loop ended");
+    });
+
+    tokio::spawn(async move {
+        while let Some(data) = msg_rx.recv().await {
+            handle_publisher_message(coordinator.clone(), data, tx.clone()).await;
+        }
+        warn!("Publisher message consumer ended");
+    });
+}
+
+fn spawn_chunk_processor(coordinator: Arc<DefaultCoordinator>, mut rx: Receiver<String>){
+    tokio::spawn(async move {
+        info!("Starting chunk processor");
+        let mut batch: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        while let Some(first) = rx.recv().await {
+            // Coalesce the duplicates that piled up while the previous batch
+            // was being processed. A signal only means "something changed for
+            // this instance, go look", so N queued signals for one instance
+            // are worth exactly one dispatch — and under load most of them
+            // were: 52% of dispatches in a 50 XT/s run were `dispatch_skip`
+            // no-ops. Draining preserves arrival order so no instance is
+            // starved by a busier one.
+            batch.clear();
+            seen.clear();
+            seen.insert(first.clone());
+            batch.push(first);
+            while let Ok(id) = rx.try_recv() {
+                if seen.insert(id.clone()) {
+                    batch.push(id);
+                }
+            }
+            if batch.len() > 1 {
+                xtflow!(
+                    "dispatch_batch",
+                    unique = batch.len(),
+                    coalesced = seen.len(),
+                    queued = rx.len(),
+                );
+            }
+
+            for instance_id in std::mem::take(&mut batch) {
+            // Always dispatch on a fresh fetch of the chunk's current state
+            // rather than any snapshot carried by the signal itself — the
+            // signal only ever means "something changed for this instance,
+            // go look." This is what makes register_xt only reachable via
+            // the `None` arm: once an instance exists in `inflight_chunks`
+            // (even at `Aborted`), a late/duplicate `Registered` signal for
+            // it lands in the `Some` arm instead and is re-dispatched on its
+            // real current stage, so it can never be mistaken for a fresh
+            // registration.
+            let dispatch_started = std::time::Instant::now();
+            match coordinator.get_inflight_chunk(&instance_id).await {
+                Some(mut chunk) => {
+                    if chunk.confirmed_stage == Some(chunk.stage) {
+                        // Already fully processed for this stage; a
+                        // duplicate/late signal, nothing new to do.
+                        xtflow!(
+                            "dispatch_skip",
+                            instance_id = instance_id,
+                            chunk_stage = format!("{:?}", chunk.stage),
+                            confirmed_stage = format!("{:?}", chunk.confirmed_stage),
+                        );
+                        continue;
+                    }
+                    xtflow!(
+                        "dispatch",
+                        instance_id = instance_id,
+                        chunk_stage = format!("{:?}", chunk.stage),
+                        confirmed_stage = format!("{:?}", chunk.confirmed_stage),
+                        is_sender = format!("{:?}", chunk.is_sender),
+                    );
+                    match chunk.stage {
+                        WaitingForProcessing => {
+                            coordinator.process_xt(&mut chunk).await;
+                        }
+                        Confirmed => {
+                            coordinator.confirm_xt(&mut chunk).await;
+                        }
+                        Aborted => {
+                            coordinator.abort_xt(&mut chunk).await;
+                        }
+                        other => {
+                            // Nothing to run at this stage — the signal only
+                            // means "something changed", and WaitingForMessages
+                            // /WaitingForDecided are waited on, not driven.
+                            xtflow!(
+                                "dispatch_noop",
+                                instance_id = instance_id,
+                                chunk_stage = format!("{other:?}"),
+                            );
+                        }
+                    }
+                }
+                None => {
+                    xtflow!("dispatch", instance_id = instance_id, chunk_stage = "Registered");
+                    let mut chunk = TransactionChunk {
+                        instance_id: instance_id.clone(),
+                        stage: Registered,
+                        ..Default::default()
+                    };
+                    coordinator.register_xt(&mut chunk).await;
+                }
+            }
+            xtflow!(
+                "dispatch_done",
+                instance_id = instance_id,
+                took_ms = dispatch_started.elapsed().as_millis(),
+                queued = rx.len(),
+            );
+            }
+        }
+    });
+}
+
+/// Stands in for a real op-succinct prover: periodically POSTs a
+/// fabricated-but-well-formed proof submission to the publisher's
+/// `/v1/proofs/op-succinct` endpoint for this sidecar's own chain. The
+/// publisher never validates proof content itself (see the "not our job,
+/// L1 does it" TODO in `receive_proof`), and the `superblock_number` field
+/// is likewise ignored by the publisher — it always finalizes against its
+/// own locally tracked `next_superblock_number` once every registered chain
+/// has submitted something for the current round. Pairs with a
+/// `MockVerifier` contract on L1 that accepts any proof unconditionally, so
+/// the full pipeline (including the L1 submission) can be exercised without
+/// running a real ZK prover.
+fn spawn_mock_proof_submitter(chain_id: u64, cfg: MockProofArgs) {
+    if cfg.publisher_http_addr.is_empty() {
+        warn!("mock-proof.enabled is set but publisher-http-addr is empty, not starting submitter");
+        return;
+    }
+
+    let url = format!("http://{}/v1/proofs/op-succinct", cfg.publisher_http_addr);
+    let interval = Duration::from_secs(cfg.interval_secs.max(1));
+
+    tokio::spawn(async move {
+        info!(url, interval_secs = cfg.interval_secs, "Starting mock proof submitter");
+        let client = reqwest::Client::new();
+        let mut ticker = tokio::time::interval(interval);
+        let mut round: u64 = 0;
+
+        loop {
+            ticker.tick().await;
+            round += 1;
+
+            // Non-zero, chain- and round-distinguishable placeholder values.
+            // Content is never cryptographically checked anywhere in this
+            // mock pipeline — only `l1_head != 0` is enforced by the
+            // publisher's handler.
+            let word = |tag: u64| format!("0x{:064x}", chain_id * 1_000_000_000 + round * 1000 + tag);
+            let addr = |tag: u64| format!("0x{:040x}", chain_id * 1_000_000_000 + round * 1000 + tag);
+
+            let body = serde_json::json!({
+                "superblock_number": round,
+                "chain_id": chain_id,
+                "aggregation_outputs": {
+                    "l1Head": word(1),
+                    "l2PreRoot": word(2),
+                    "l2PostRoot": word(3),
+                    "l2BlockNumber": round,
+                    "rollupConfigHash": word(4),
+                    "mailboxRoot": word(5),
+                    "multiBlockVKey": word(6),
+                    "proverAddress": addr(7),
+                },
+                "agg_vkey_hash": word(8),
+            });
+
+            match client.post(&url).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(round, "Mock proof submitted");
+                }
+                Ok(resp) => {
+                    warn!(round, status = %resp.status(), "Mock proof submission rejected");
+                }
+                Err(e) => {
+                    warn!(round, error = %e, "Mock proof submission failed");
+                }
+            }
+        }
     });
 }
 

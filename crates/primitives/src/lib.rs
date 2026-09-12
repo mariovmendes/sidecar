@@ -3,6 +3,8 @@
 //! This crate contains common identifiers and payload types used by
 //! coordination, simulation, mailbox, and server crates.
 
+pub mod xtflow;
+
 use alloy::primitives::{Address, B256, U256};
 pub use alloy_rpc_types_eth::state::StateOverride;
 use serde::{Deserialize, Serialize};

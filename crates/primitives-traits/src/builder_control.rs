@@ -16,6 +16,16 @@ pub trait XtBuilderClient: Send + Sync + 'static {
         transactions: Vec<Vec<u8>>,
     ) -> Result<(), CoordinatorError>;
 
+    /// Submits transaction to be included without any prior reservation needed.
+    async fn submit_tx(&self, tx: &[u8]) -> Result<(), CoordinatorError>;
+
+    /// Followup on an instance by submitting the putInbox transaction.
+    async fn submit_followup_xt(
+        &self,
+        instance_id: &str,
+        put_inbox_transactions: Vec<Vec<u8>>,
+    ) -> Result<(), CoordinatorError>;
+
     /// Release a previously reserved XT so the builder may execute it.
     ///
     /// `put_inbox_transactions` must already be signed and ordered before the

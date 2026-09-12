@@ -38,12 +38,3 @@ log:
   level: "info"
   # Log format: json, pretty
   format: "json"
-
-# External verification hook (called on inbound cross-rollup XTs before commit vote)
-verification:
-  # Enable/disable the verification hook
-  enabled: false
-  # HTTP URL the destination sequencer calls during Prepare
-  url: ""
-  # Request timeout in milliseconds
-  timeout_ms: 2000

@@ -21,6 +21,12 @@ struct SubmitXtRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct FollowupXtRequest {
+    instance_id: String,
+    transactions: Vec<Bytes>,
+}
+
+#[derive(Debug, Serialize)]
 struct ReleaseXtRequest {
     instance_id: String,
     transactions: Vec<Bytes>,
@@ -102,11 +108,15 @@ impl HttpXtBuilderClient {
             .await
             .map_err(|err| CoordinatorError::BuilderControl(err.to_string()))?;
 
+        // A JSON-RPC error means the builder saw the request and refused it,
+        // as opposed to the transport failures above where the outcome is
+        // unknown. Callers use that distinction to decide whether the nonce
+        // the transaction reserved can be recycled.
         if let Some(error) = response.error {
-            return Err(CoordinatorError::BuilderControl(format!(
-                "{method} failed with code {}: {}",
-                error.code, error.message
-            )));
+            return Err(CoordinatorError::BuilderRejected {
+                method: method.to_string(),
+                message: format!("code {}: {}", error.code, error.message),
+            });
         }
 
         Ok(())
@@ -132,6 +142,29 @@ impl XtBuilderClient for HttpXtBuilderClient {
         };
 
         self.call("ethera_submitXt", request).await
+    }
+
+    async fn submit_tx(&self, tx: &[u8]) -> Result<(), CoordinatorError> {
+        self.call("eth_sendRawTransaction", Bytes::copy_from_slice(tx))
+            .await
+    }
+
+    async fn submit_followup_xt(
+        &self,
+        instance_id: &str,
+        put_inbox_transactions: Vec<Vec<u8>>,
+    ) -> Result<(), CoordinatorError> {
+        self.call(
+            "ethera_submitFollowup",
+            FollowupXtRequest {
+                instance_id: instance_id.to_string(),
+                transactions: put_inbox_transactions
+                    .into_iter()
+                    .map(Bytes::from)
+                    .collect(),
+            },
+        )
+        .await
     }
 
     async fn release_xt(

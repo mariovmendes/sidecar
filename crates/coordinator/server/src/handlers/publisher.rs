@@ -7,10 +7,11 @@ use compose_coordinator::coordinator::DefaultCoordinator;
 use compose_primitives::{PeriodId, SuperblockNumber};
 use compose_proto::wire_message::Payload;
 use prost::Message;
+use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, warn};
 
 /// Dispatch an inbound protobuf message from the publisher connection.
-pub async fn handle_publisher_message(coordinator: Arc<DefaultCoordinator>, data: Bytes) {
+pub async fn handle_publisher_message(coordinator: Arc<DefaultCoordinator>, data: Bytes, sender: Sender<String>) {
     let msg = match compose_proto::WireMessage::decode(data) {
         Ok(m) => m,
         Err(e) => {
@@ -30,9 +31,10 @@ pub async fn handle_publisher_message(coordinator: Arc<DefaultCoordinator>, data
             }
         }
         Some(Payload::StartInstance(start_instance)) => {
-            if let Err(e) = coordinator.handle_start_instance(&start_instance).await {
+            if let Err(e) = coordinator.handle_start_instance(&start_instance, &sender).await {
                 error!(error = %e, "Failed to handle StartInstance");
             }
+            drop(sender);
         }
         Some(Payload::StartPeriod(start_period)) => {
             if let Err(e) = coordinator
@@ -64,6 +66,9 @@ pub async fn handle_publisher_message(coordinator: Arc<DefaultCoordinator>, data
         }
         Some(Payload::Vote(_)) => {
             debug!("Received vote from publisher (ignored by sidecar)");
+        }
+        Some(Payload::Confirmed(_)) =>{
+            debug!("Confirmed the inclusion of a cross-chain transaction");
         }
         other => {
             warn!(?other, "Unhandled publisher message type");

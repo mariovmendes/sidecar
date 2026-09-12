@@ -9,14 +9,14 @@ use compose_peer::traits::PeerCoordinator;
 use compose_primitives::{ChainId, InstanceId, PeriodId, SequenceNumber, SuperblockNumber};
 use compose_simulation::traits::Simulator;
 use prost::Message;
-use reqwest::Client;
-use tokio::sync::{oneshot, Notify, RwLock};
+use tokio::sync::{oneshot, RwLock};
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
 use compose_metrics::SidecarMetrics;
 use compose_primitives_traits::{
-    CoordinatorError, MailboxSender, PublisherClient, PutInboxBuilder, XtBuilderClient,
+    CoordinatorError, L2BridgeTxBuilder, MailboxSender, PublisherClient, PutInboxBuilder,
+    XtBuilderClient,
 };
 use compose_proto::{wire_message::Payload, MailboxMessage};
 
@@ -24,19 +24,76 @@ use crate::model::chain_overlay::ChainOverlay;
 use crate::model::pending_xt::PendingXt;
 use crate::model::xt_status::{determine_xt_status, XtStatusResponse};
 use crate::nonce_manager::DeferredNonceManager;
-use crate::pipeline::delivery::build_sender_nonce_cache;
+use crate::pipeline::delivery::{build_sender_nonce_cache, describe_txs};
 use crate::pipeline::submission::{build_xt_request, xt_request_fingerprint};
+use compose_primitives::xtflow;
 
 type PendingSubmissionResult = Result<InstanceId, String>;
 type PendingSubmissionSender = oneshot::Sender<PendingSubmissionResult>;
 
-/// Inbound verification hook configuration.
-#[derive(Debug, Clone, Default)]
-pub struct VerificationConfig {
-    pub enabled: bool,
-    pub url: String,
-    pub timeout_ms: u64,
+// Transaction chunks
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChunkStage {
+    #[default]
+    Registered,
+    WaitingForMessages,
+    WaitingForProcessing,
+    WaitingForDecided,
+    Confirmed,
+    Aborted,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct TransactionChunk {
+    pub instance_id: String,
+    pub confirmed_stage: Option<ChunkStage>,
+    pub stage: ChunkStage,
+    pub organised_transactions: HashMap<String, Vec<u8>>,
+    pub is_sender: Option<bool>,
+    /// How many times finalization (`sendConfirm`/`recvConfirm`) or
+    /// compensation (`sendAbort`/`recvAbort`) has been attempted and failed.
+    ///
+    /// A failed compensation leaves the user's tokens escrowed on the sender
+    /// chain with nothing on the way to refund them, so the attempt must be
+    /// repeated rather than dropped. The watchdog re-dispatches chunks whose
+    /// `confirmed_stage` never caught up with `stage`, up to
+    /// [`MAX_FINALIZE_ATTEMPTS`].
+    pub finalize_attempts: u32,
+}
+
+/// Cap on automatic finalize/compensate retries before the instance is
+/// escalated. Reaching it means tokens may be stranded, so it is logged as
+/// `finalize_abandoned` rather than passing silently.
+pub const MAX_FINALIZE_ATTEMPTS: u32 = 10;
+
+/// Admission bound: how many XTs may be in flight (accepted, not yet decided)
+/// before new ones are refused.
+///
+/// Set deliberately high: at the rates measured so far this gate is not the
+/// binding constraint and is not meant to be. A 2-client / 20 tx-per-second
+/// run never reached it once (0 rejections, peak 149 undecided, chunk queue
+/// median 0) — the losses there came from coordinator nonce desyncs, not from
+/// backlog.
+///
+/// It still bounds memory, and it still stops the unbounded-queue collapse
+/// seen at ~50 XT/s, where residence time passed the publisher's 20 s
+/// `CONSENSUS_TIMEOUT` and 70% of a run died by timeout. Note that the signal
+/// it watches — XTs awaiting a decision — is itself capped by that timeout, so
+/// it under-reports a genuinely backlogged pipeline; the chunk queue depth
+/// (`dispatch_done ... queued=`) is the honest measure of how far behind the
+/// processor is.
+///
+/// ponytail: a plain constant, not config, and it watches the weaker of the
+/// two available signals. Gate on chunk queue depth, or wire this to
+/// `SidecarArgs`, if it ever needs to actually bite.
+pub const MAX_PENDING_XTS: usize = 10_000;
+
+/// How many failed finalizations the watchdog re-queues per tick.
+const FINALIZE_RETRIES_PER_TICK: usize = 50;
+
+/// How many stuck instances the watchdog names per tick. The rest are counted
+/// only: logging thousands of lines per tick is itself a stall.
+const STUCK_REPORT_LIMIT: usize = 20;
 
 /// Shared coordinator state protected by a `RwLock`.
 #[derive(Debug)]
@@ -52,8 +109,6 @@ pub(crate) struct CoordinatorState {
     /// Per-chain overlay of post-simulation state diffs. Lets XT-B see the
     /// state produced by XT-A within the current coordinator window.
     pub chain_overlay: HashMap<ChainId, ChainOverlay>,
-    /// Notified whenever a mailbox message arrives, waking waiting simulations.
-    pub mailbox_notify: Arc<Notify>,
     /// Maps XT fingerprints to instance IDs for standalone-mode deduplication.
     pub submitted_fingerprints: HashMap<String, InstanceId>,
     /// Oneshot channels waiting for the publisher to assign an instance ID
@@ -69,6 +124,8 @@ pub(crate) struct CoordinatorState {
     /// bytes and drained into `PendingXt::pending_mailbox` the moment the XT
     /// is registered.  Entries are cleared on rollback when the period resets.
     pub mailbox_buffer: HashMap<Vec<u8>, Vec<MailboxMessage>>,
+    pub inflight_chunks: HashMap<String, TransactionChunk>,
+    pub mailbox_messages: HashMap<String, Vec<MailboxMessage>>,
 }
 
 impl CoordinatorState {
@@ -82,24 +139,13 @@ impl CoordinatorState {
             last_known_blocks: HashMap::new(),
             origin_seq: SequenceNumber(0),
             chain_overlay: HashMap::new(),
-            mailbox_notify: Arc::new(Notify::new()),
             submitted_fingerprints: HashMap::new(),
             pending_submissions: HashMap::new(),
             mailbox_index: HashMap::new(),
             mailbox_buffer: HashMap::new(),
+            inflight_chunks: HashMap::new(),
+            mailbox_messages: HashMap::new(),
         }
-    }
-
-    /// Buffer a mailbox message for an XT that has not yet been registered.
-    ///
-    /// Called when a CIRC message arrives before the forwarded XT, which can
-    /// happen when sidecar-a's simulation completes in <1 ms and the outbound
-    /// message reaches sidecar-b before the XT forward does.
-    pub(crate) fn buffer_orphan_mailbox(&mut self, msg: MailboxMessage) {
-        self.mailbox_buffer
-            .entry(msg.instance_id.clone())
-            .or_default()
-            .push(msg);
     }
 
     /// Drain any buffered mailbox messages for the given raw `instance_id` key
@@ -123,12 +169,12 @@ pub struct DefaultCoordinator {
     pub(crate) mailbox_queue: Option<Arc<dyn MailboxQueue>>,
     pub(crate) peer_coordinator: Option<Arc<dyn PeerCoordinator>>,
     pub(crate) put_inbox_builder: Option<Arc<dyn PutInboxBuilder>>,
+    pub(crate) l2_bridge_builder: Option<Arc<dyn L2BridgeTxBuilder>>,
     pub(crate) xt_builder_client: Option<Arc<dyn XtBuilderClient>>,
     pub(crate) circ_timeout_ms: u64,
     pub(crate) task_tracker: TaskTracker,
     pub(crate) metrics: Option<Arc<SidecarMetrics>>,
-    pub(crate) verification: VerificationConfig,
-    pub(crate) verification_client: Option<Client>,
+    pub(crate) chunk_sender: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 impl std::fmt::Debug for DefaultCoordinator {
@@ -150,7 +196,6 @@ impl DefaultCoordinator {
         mailbox_queue: Option<Arc<dyn MailboxQueue>>,
         peer_coordinator: Option<Arc<dyn PeerCoordinator>>,
         circ_timeout_ms: u64,
-        verification: VerificationConfig,
     ) -> Self {
         Self {
             chain_id,
@@ -162,18 +207,27 @@ impl DefaultCoordinator {
             mailbox_queue,
             peer_coordinator,
             put_inbox_builder: None,
+            l2_bridge_builder: None,
             xt_builder_client: None,
             circ_timeout_ms,
             task_tracker: TaskTracker::new(),
             metrics: None,
-            verification_client: Self::build_verification_client(&verification),
-            verification,
+            chunk_sender: None,
         }
     }
 
     /// Attach a metrics instance to this coordinator.
     pub fn set_metrics(&mut self, metrics: Arc<SidecarMetrics>) {
         self.metrics = Some(metrics);
+    }
+
+    /// Attach the sender half of the main.rs chunk-processing signal channel.
+    /// Only an `instance_id` is ever sent through it — the chunk processor
+    /// always re-fetches the current `TransactionChunk` from `state` at
+    /// dispatch time via `get_inflight_chunk`, so there's a single source of
+    /// truth and no risk of dispatching on a stale snapshot.
+    pub fn set_chunk_sender(&mut self, sender: tokio::sync::mpsc::Sender<String>) {
+        self.chunk_sender = Some(sender);
     }
 
     /// Attach a putInbox signer used for local dependency fulfillment.
@@ -186,26 +240,49 @@ impl DefaultCoordinator {
         self.xt_builder_client = Some(client);
     }
 
-    fn build_verification_client(verification: &VerificationConfig) -> Option<Client> {
-        if !verification.enabled {
-            return None;
-        }
+    /// Attach a signer for `ComposeL2ToL2Bridge` finalize/compensate
+    /// transactions (`sendConfirm`, `sendAbort*`, `recvConfirm*`, `recvAbort*`).
+    pub fn set_l2_bridge_builder(&mut self, builder: Arc<dyn L2BridgeTxBuilder>) {
+        self.l2_bridge_builder = Some(builder);
+    }
 
-        Some(
-            Client::builder()
-                .timeout(Duration::from_millis(verification.timeout_ms))
-                .build()
-                .expect("verification client configuration should be valid"),
-        )
+    /// Current inflight chunk for `instance_id`, if any, a fresh clone, read
+    /// and released immediately. This is the single source of truth the
+    /// chunk processor dispatches on; callers must not hold a chunk fetched
+    /// this way across a call into `register_xt`/`process_xt`/`confirm_xt`/
+    /// `abort_xt`, which themselves lock `state` internally.
+    pub async fn get_inflight_chunk(&self, instance_id: &str) -> Option<TransactionChunk> {
+        self.state
+            .read()
+            .await
+            .inflight_chunks
+            .get(instance_id)
+            .cloned()
     }
 
     /// Start the coordinator's background tasks (cleanup loop, etc.).
+    ///
+    /// Requires the chunk sender to be attached first: the tasks below are
+    /// spawned from clones of `self`, and `chunk_sender` is a plain field, so
+    /// one attached afterwards would be invisible to them and the watchdog
+    /// could never re-dispatch a failed finalization.
     pub async fn start(&self) -> Result<(), CoordinatorError> {
+        if self.chunk_sender.is_none() {
+            return Err(CoordinatorError::ChunkSenderNotSet(
+                "set_chunk_sender must be called before start()".to_string(),
+            ));
+        }
+
         info!(chain_id = %self.chain_id, "Starting coordinator");
 
         let coord = self.clone();
         self.task_tracker.spawn(async move {
             coord.cleanup_loop().await;
+        });
+
+        let coord = self.clone();
+        self.task_tracker.spawn(async move {
+            coord.watchdog_loop().await;
         });
 
         Ok(())
@@ -261,6 +338,30 @@ impl DefaultCoordinator {
         for key in orphan_keys {
             state.mailbox_buffer.remove(&key);
         }
+        // Nothing else ever removes these two, so they grow for the process
+        // lifetime and are re-scanned by `stuck_scan` and
+        // `retry_unfinished_finalizations` every 10s.
+        //
+        // A chunk is only safe to drop once it is *finished*: `confirmed_stage`
+        // caught up to its terminal `stage`. One still short of that is either
+        // mid-retry or abandoned past `MAX_FINALIZE_ATTEMPTS` with escrow that
+        // may need manual compensation. Dropping either would erase the only
+        // record of it. Losing the chunk is also not neutral: the chunk
+        // processor treats a missing `inflight_chunks` entry as a *fresh*
+        // registration (main.rs's `None` arm), so a late signal for a pruned
+        // instance would re-run `register_xt` on an XT that already finished.
+        // Gating on `pending` is what makes that unreachable, every path that
+        // enqueues a signal resolves the instance through `pending` or
+        // `mailbox_index` (itself rebuilt from `pending` above) first.
+        let state = &mut *state;
+        state.inflight_chunks.retain(|id, chunk| {
+            chunk.confirmed_stage != Some(chunk.stage) || state.pending.contains_key(id.as_str())
+        });
+        // Kept alive by either side: `abort_xt` still reads a decided chunk's
+        // messages to rebuild its removeInbox payload.
+        state.mailbox_messages.retain(|id, _| {
+            state.pending.contains_key(id.as_str()) || state.inflight_chunks.contains_key(id)
+        });
         if let Some(m) = &self.metrics {
             m.mailbox_buffer_size.set(state.mailbox_buffer.len() as i64);
         }
@@ -272,6 +373,291 @@ impl DefaultCoordinator {
             interval.tick().await;
             self.cleanup(Duration::from_secs(300)).await;
         }
+    }
+
+    /// Periodic liveness dump. The sidecar has no timer of its own: the
+    /// consensus round is bounded by the publisher's SCP timeout
+    /// (`CONSENSUS_TIMEOUT`), which broadcasts `Decided(false)` and lands here
+    /// as an ordinary decision. Everything after that decision (the abort
+    /// compensation, the builder's inclusion callback) is unbounded, so an XT
+    /// that loses a mailbox message or a builder callback sits in
+    /// `inflight_chunks` indefinitely, and 10000 such undecided XTs make
+    /// `MAX_PENDING_XTS` reject every new submission.
+    ///
+    /// This loop makes both visible: one `state_dump` line per tick plus one
+    /// `stuck` line per XT undecided or unconfirmed for longer than
+    /// `STUCK_AFTER`. An XT still stuck well past the publisher's timeout
+    /// means the `Decided` never arrived or never reached its chunk.
+    async fn watchdog_loop(&self) {
+        // Just over the publisher's default 20s CONSENSUS_TIMEOUT, so a
+        // normally-timing-out round doesn't show up as stuck.
+        const STUCK_AFTER: Duration = Duration::from_secs(25);
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            self.retry_unfinished_finalizations().await;
+            self.stuck_scan(STUCK_AFTER).await;
+        }
+    }
+
+    /// Re-dispatch chunks whose finalize/compensate step never completed.
+    ///
+    /// `confirm_xt`/`abort_xt` only record `confirmed_stage` once their
+    /// on-chain step has actually been submitted, so a chunk sitting at
+    /// `Confirmed`/`Aborted` with a lagging `confirmed_stage` is one whose
+    /// `sendConfirm`/`sendAbort` failed. Nothing else would ever wake it: the
+    /// publisher broadcasts each decision once. For an abort that means the
+    /// user's escrowed tokens are waiting on a refund that will never be
+    /// retried.
+    async fn retry_unfinished_finalizations(&self) {
+        // One pass under the read lock, collecting a capped retry batch and a
+        // count of the ones that have exhausted their attempts. Re-queueing
+        // thousands of retries into the same serial processor starves the live
+        // traffic they compete with, and the leftovers are picked up on the
+        // next tick anyway.
+        let (retry, abandoned, abandoned_sample) = {
+            let state = self.state.read().await;
+            let mut retry: Vec<(String, ChunkStage, u32)> = Vec::new();
+            let mut abandoned = 0usize;
+            let mut abandoned_sample: Vec<String> = Vec::new();
+
+            for chunk in state.inflight_chunks.values() {
+                if !matches!(chunk.stage, ChunkStage::Confirmed | ChunkStage::Aborted)
+                    || chunk.confirmed_stage == Some(chunk.stage)
+                {
+                    continue;
+                }
+                if chunk.finalize_attempts >= MAX_FINALIZE_ATTEMPTS {
+                    abandoned += 1;
+                    if abandoned_sample.len() < STUCK_REPORT_LIMIT {
+                        abandoned_sample.push(chunk.instance_id.clone());
+                    }
+                    continue;
+                }
+                if retry.len() < FINALIZE_RETRIES_PER_TICK {
+                    retry.push((
+                        chunk.instance_id.clone(),
+                        chunk.stage,
+                        chunk.finalize_attempts,
+                    ));
+                }
+            }
+
+            (retry, abandoned, abandoned_sample)
+        };
+
+        // Escalated once per tick as a summary rather than per instance: each
+        // one may have left escrowed funds needing manual compensation.
+        if abandoned > 0 {
+            xtflow!(
+                "finalize_abandoned",
+                chain = self.chain_id,
+                count = abandoned,
+                instances = abandoned_sample.join(","),
+            );
+            error!(
+                abandoned,
+                "Gave up on finalization; escrowed funds may need manual compensation"
+            );
+        }
+
+        let Some(sender) = self.chunk_sender.as_ref() else {
+            if !retry.is_empty() {
+                warn!(
+                    count = retry.len(),
+                    "No chunk sender configured, cannot retry finalizations"
+                );
+            }
+            return;
+        };
+
+        for (instance_id, stage, attempts) in retry {
+            xtflow!(
+                "finalize_retry",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                stage = format!("{stage:?}"),
+                attempts = attempts,
+            );
+            if let Err(e) = sender.send(instance_id.clone()).await {
+                warn!(instance_id, error = %e, "Failed to enqueue finalization retry");
+            }
+        }
+    }
+
+    /// XTs accepted but not yet decided. This is the queue depth that matters:
+    /// each one must reach a decision before the publisher's SCP timeout.
+    pub(crate) async fn inflight_xt_count(&self) -> usize {
+        self.state
+            .read()
+            .await
+            .pending
+            .values()
+            .filter(|xt| xt.decision.is_none())
+            .count()
+    }
+
+    /// Record that a finalize/compensate attempt failed, so the watchdog can
+    /// bound how often it is retried.
+    pub(crate) async fn record_finalize_failure(&self, instance_id: &str) -> u32 {
+        let mut state = self.state.write().await;
+        match state.inflight_chunks.get_mut(instance_id) {
+            Some(chunk) => {
+                chunk.finalize_attempts = chunk.finalize_attempts.saturating_add(1);
+                chunk.finalize_attempts
+            }
+            None => 0,
+        }
+    }
+
+    /// Report the oldest stuck instances and a one-line summary.
+    ///
+    /// Everything is collected under the read lock and formatted *after* it is
+    /// released, and only [`STUCK_REPORT_LIMIT`] instances are named. The
+    /// earlier version logged one line per stuck XT while holding the lock.
+    async fn stuck_scan(&self, stuck_after: Duration) {
+        struct StuckXt {
+            instance_id: String,
+            age_ms: u128,
+            chunk_stage: String,
+            confirmed_stage: String,
+            is_sender: String,
+            decision: String,
+            local_vote: String,
+            peer_votes: usize,
+            expected_votes: usize,
+            mailbox_msgs: usize,
+        }
+
+        let (
+            undecided,
+            unconfirmed,
+            stuck_total,
+            worst,
+            pending_len,
+            chunk_len,
+            stages,
+            period,
+            last_seq,
+        ) = {
+            let state = self.state.read().await;
+            let mut undecided = 0usize;
+            let mut unconfirmed = 0usize;
+            let mut stuck_total = 0usize;
+            // Kept sorted-by-age via a bounded insert, so this stays O(pending)
+            // with a tiny constant instead of collecting every stuck instance.
+            let mut worst: Vec<StuckXt> = Vec::with_capacity(STUCK_REPORT_LIMIT + 1);
+
+            for (id, xt) in &state.pending {
+                let decided = xt.decision.is_some();
+                if !decided {
+                    undecided += 1;
+                }
+                if decided && xt.confirmed_at.is_some() {
+                    continue;
+                }
+                if decided {
+                    unconfirmed += 1;
+                }
+                let age = xt.created_at.elapsed();
+                if age < stuck_after {
+                    continue;
+                }
+                stuck_total += 1;
+
+                let age_ms = age.as_millis();
+                if worst.len() == STUCK_REPORT_LIMIT
+                    && worst.last().is_some_and(|w| w.age_ms >= age_ms)
+                {
+                    continue;
+                }
+                let chunk = state.inflight_chunks.get(id.as_str());
+                let entry = StuckXt {
+                    instance_id: id.to_string(),
+                    age_ms,
+                    chunk_stage: chunk
+                        .map(|c| format!("{:?}", c.stage))
+                        .unwrap_or_else(|| "no_chunk".to_string()),
+                    confirmed_stage: chunk
+                        .map(|c| format!("{:?}", c.confirmed_stage))
+                        .unwrap_or_else(|| "-".to_string()),
+                    is_sender: chunk
+                        .map(|c| format!("{:?}", c.is_sender))
+                        .unwrap_or_else(|| "-".to_string()),
+                    decision: format!("{:?}", xt.decision),
+                    local_vote: format!("{:?}", xt.local_vote),
+                    peer_votes: xt.peer_votes.len(),
+                    expected_votes: xt.raw_txs.len(),
+                    mailbox_msgs: state
+                        .mailbox_messages
+                        .get(id.as_str())
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                };
+                let at = worst.partition_point(|w| w.age_ms > age_ms);
+                worst.insert(at, entry);
+                worst.truncate(STUCK_REPORT_LIMIT);
+            }
+
+            let mut stages: HashMap<String, usize> = HashMap::new();
+            for chunk in state.inflight_chunks.values() {
+                *stages.entry(format!("{:?}", chunk.stage)).or_default() += 1;
+            }
+            let mut stages: Vec<String> = stages
+                .into_iter()
+                .map(|(stage, count)| format!("{stage}:{count}"))
+                .collect();
+            stages.sort();
+
+            (
+                undecided,
+                unconfirmed,
+                stuck_total,
+                worst,
+                state.pending.len(),
+                state.inflight_chunks.len(),
+                stages,
+                state.current_period_id.0,
+                state.last_sequence_num.0,
+            )
+        }; // lock released before any formatting or I/O
+
+        for xt in &worst {
+            xtflow!(
+                "stuck",
+                instance_id = xt.instance_id,
+                chain = self.chain_id,
+                age_ms = xt.age_ms,
+                chunk_stage = xt.chunk_stage,
+                confirmed_stage = xt.confirmed_stage,
+                is_sender = xt.is_sender,
+                decision = xt.decision,
+                local_vote = xt.local_vote,
+                peer_votes = xt.peer_votes,
+                expected_votes = xt.expected_votes,
+                mailbox_msgs = xt.mailbox_msgs,
+            );
+        }
+
+        xtflow!(
+            "state_dump",
+            chain = self.chain_id,
+            pending = pending_len,
+            undecided = undecided,
+            max_inflight = MAX_PENDING_XTS,
+            stuck = stuck_total,
+            stuck_reported = worst.len(),
+            decided_unconfirmed = unconfirmed,
+            inflight_chunks = chunk_len,
+            chunk_stages = if stages.is_empty() {
+                "-".to_string()
+            } else {
+                stages.join(",")
+            },
+            period = period,
+            last_seq = last_seq,
+            recycled_nonces = self.nonce_manager.freed_count().await,
+        );
     }
 
     pub(crate) async fn resolve_pending_submission(
@@ -382,8 +768,30 @@ impl DefaultCoordinator {
         &self,
         txs: HashMap<ChainId, Vec<Vec<u8>>>,
     ) -> Result<String, CoordinatorError> {
+        xtflow!(
+            "submit_received",
+            chain = self.chain_id,
+            chains = txs.len(),
+            txs = describe_txs(&txs),
+        );
         if txs.is_empty() {
             return Err(CoordinatorError::NoTransactions);
+        }
+
+        // Shed load here, before the publisher assigns an instance and
+        // broadcasts it to every sidecar. Rejecting at this door costs one
+        // error response; rejecting later — or not at all — costs a publisher
+        // round trip, two registrations and an abort with compensation on both
+        // chains, all for an XT that cannot finish inside the SCP timeout.
+        let inflight = self.inflight_xt_count().await;
+        if inflight >= MAX_PENDING_XTS {
+            xtflow!(
+                "admission_rejected",
+                chain = self.chain_id,
+                inflight = inflight,
+                max_inflight = MAX_PENDING_XTS,
+            );
+            return Err(CoordinatorError::TooManyPendingInstances(MAX_PENDING_XTS));
         }
         if txs.len() < 2 {
             return Err(CoordinatorError::Other(
@@ -431,28 +839,80 @@ impl DefaultCoordinator {
 
             if let Err(e) = publisher.send_raw(&data).await {
                 let message = format!("failed to send XT to publisher: {e}");
+                xtflow!(
+                    "publisher_submit_failed",
+                    chain = self.chain_id,
+                    fingerprint = fingerprint,
+                    error = e,
+                );
                 self.resolve_pending_submission(&fingerprint, Err(message.clone()))
                     .await;
                 return Err(CoordinatorError::Other(message));
             }
+            xtflow!(
+                "publisher_submit",
+                chain = self.chain_id,
+                fingerprint = fingerprint,
+                txs = describe_txs(&txs),
+            );
+        } else {
+            xtflow!(
+                "publisher_submit_joined",
+                chain = self.chain_id,
+                fingerprint = fingerprint,
+            );
         }
 
         // Wait for the publisher to respond with StartInstance, which carries
-        // the canonical instance_id.
-        let instance_id = tokio::time::timeout(Duration::from_secs(10), rx)
-            .await
-            .map_err(|_| {
-                CoordinatorError::Other(
+        // the canonical instance_id. This 10s cap is the *only* timeout on the
+        // submission path: once an instance_id is assigned nothing else in the
+        // pipeline is time-bounded (see `stuck_scan` in the watchdog loop).
+        let waited = std::time::Instant::now();
+        let assigned = tokio::time::timeout(Duration::from_secs(10), rx).await;
+        let instance_id = match assigned {
+            Err(_) => {
+                xtflow!(
+                    "publisher_assign_timeout",
+                    chain = self.chain_id,
+                    fingerprint = fingerprint,
+                    waited_ms = waited.elapsed().as_millis(),
+                    timeout_ms = 10_000,
+                );
+                return Err(CoordinatorError::Other(
                     "timed out waiting for publisher to assign instance_id".to_string(),
-                )
-            })?
-            .map_err(|_| {
-                CoordinatorError::Other(
+                ));
+            }
+            Ok(Err(_)) => {
+                xtflow!(
+                    "publisher_assign_dropped",
+                    chain = self.chain_id,
+                    fingerprint = fingerprint,
+                    waited_ms = waited.elapsed().as_millis(),
+                );
+                return Err(CoordinatorError::Other(
                     "publisher submission resolution dropped unexpectedly".to_string(),
-                )
-            })?
-            .map_err(CoordinatorError::Other)?;
+                ));
+            }
+            Ok(Ok(Err(e))) => {
+                xtflow!(
+                    "publisher_assign_rejected",
+                    chain = self.chain_id,
+                    fingerprint = fingerprint,
+                    waited_ms = waited.elapsed().as_millis(),
+                    error = e,
+                );
+                return Err(CoordinatorError::Other(e));
+            }
+            Ok(Ok(Ok(id))) => id,
+        };
 
+        xtflow!(
+            "publisher_assigned",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            fingerprint = fingerprint,
+            waited_ms = waited.elapsed().as_millis(),
+        );
         info!(instance_id = %instance_id, "Submitted XT to publisher");
         Ok(instance_id.to_string())
     }
@@ -461,8 +921,6 @@ impl DefaultCoordinator {
         &self,
         txs: HashMap<ChainId, Vec<Vec<u8>>>,
     ) -> Result<String, CoordinatorError> {
-        const MAX_PENDING_XTS: usize = 100;
-
         // Compute fingerprint before acquiring the lock to detect duplicates.
         let xt_request = build_xt_request(&txs);
         let fingerprint = xt_request_fingerprint(&xt_request);
@@ -506,7 +964,7 @@ impl DefaultCoordinator {
             xt.sender_nonces = build_sender_nonce_cache(&txs);
             xt.raw_txs = txs;
             // Pre-lock so only one local simulation task claims this XT.
-            xt.locked_chains.insert(self.chain_id);
+            //xt.locked_chains.insert(self.chain_id);
 
             state
                 .mailbox_index
@@ -531,6 +989,11 @@ impl DefaultCoordinator {
             m.xt_received_total.inc();
             m.xt_pending_count.inc();
         }
+        xtflow!(
+            "registered_standalone",
+            instance_id = instance_id,
+            chain = self.chain_id,
+        );
         info!(instance_id = %instance_id, "Submitted XT locally (standalone mode)");
 
         // Start simulation immediately after local registration.
@@ -538,7 +1001,11 @@ impl DefaultCoordinator {
             let coordinator = self.clone();
             let id = instance_id.clone();
             self.task_tracker.spawn(async move {
-                coordinator.process_xt(&id).await;
+                let mut chunk = TransactionChunk {
+                    instance_id: id.to_string(),
+                    ..Default::default()
+                };
+                coordinator.register_xt(&mut chunk).await;
             });
         }
 
@@ -604,6 +1071,14 @@ mod tests {
             Ok(())
         }
 
+        async fn send_confirmed(
+            &self,
+            _instance_id: &[u8],
+            _chain_id: u64,
+        ) -> Result<(), CoordinatorError> {
+            Ok(())
+        }
+
         async fn send_raw(&self, _data: &[u8]) -> Result<(), CoordinatorError> {
             self.send_raw_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -614,18 +1089,232 @@ mod tests {
         }
     }
 
+    fn chunk_at(
+        instance_id: &str,
+        stage: ChunkStage,
+        confirmed: Option<ChunkStage>,
+    ) -> TransactionChunk {
+        TransactionChunk {
+            instance_id: instance_id.to_string(),
+            stage,
+            confirmed_stage: confirmed,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_is_refused_once_the_inflight_bound_is_reached() {
+        // Load shedding at the front door: past `throughput x deadline` in
+        // flight, an accepted XT cannot reach a decision before the publisher
+        // times it out, so refusing it protects the ones that still can.
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
+
+        {
+            let mut state = coordinator.state.write().await;
+            for i in 0..MAX_PENDING_XTS {
+                let id = format!("xt-inflight-{i}");
+                let mut xt = PendingXt::new(id.clone(), id.as_bytes().to_vec());
+                xt.raw_txs.insert(ChainId(77777), vec![vec![1]]);
+                state.pending.insert(id.into(), xt); // decision: None => in flight
+            }
+            // A decided XT still sitting in `pending` must not count against
+            // the bound — it is waiting for cleanup, not for the pipeline.
+            let mut done = PendingXt::new("xt-done".to_string(), b"xt-done".to_vec());
+            done.record_decision(true);
+            state.pending.insert(done.id.clone(), done);
+        }
+
+        assert_eq!(coordinator.inflight_xt_count().await, MAX_PENDING_XTS);
+
+        let mut txs = HashMap::new();
+        txs.insert(ChainId(77777), vec![vec![1]]);
+        txs.insert(ChainId(88888), vec![vec![2]]);
+        let result = coordinator.submit_xt(txs.clone()).await;
+        assert!(
+            matches!(result, Err(CoordinatorError::TooManyPendingInstances(_))),
+            "expected admission rejection, got {result:?}"
+        );
+
+        // Once one decides, the door opens again.
+        {
+            let mut state = coordinator.state.write().await;
+            let id = InstanceId::from("xt-inflight-0");
+            state.pending.get_mut(&id).unwrap().record_decision(false);
+        }
+        assert_eq!(coordinator.inflight_xt_count().await, MAX_PENDING_XTS - 1);
+    }
+
+    #[tokio::test]
+    async fn stuck_scan_reports_the_oldest_and_only_a_bounded_number() {
+        // The watchdog used to emit one line per stuck XT while holding the
+        // state read lock — thousands per tick under overload, which stalled
+        // every state mutation behind it.
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
+
+        {
+            let mut state = coordinator.state.write().await;
+            for i in 0..(STUCK_REPORT_LIMIT * 5) {
+                let id = format!("xt-stuck-{i}");
+                let mut xt = PendingXt::new(id.clone(), id.as_bytes().to_vec());
+                xt.raw_txs.insert(ChainId(77777), vec![vec![1]]);
+                state.pending.insert(id.into(), xt);
+            }
+        }
+
+        // Everything is far older than the threshold, so the scan must still
+        // return promptly and without touching every entry twice.
+        let started = std::time::Instant::now();
+        coordinator.stuck_scan(Duration::ZERO).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "scan should stay cheap with many stuck instances"
+        );
+
+        // The lock must be free the moment the scan returns.
+        assert!(
+            coordinator.state.try_write().is_ok(),
+            "stuck_scan must not hold the state lock while logging"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_requires_the_chunk_sender_and_background_clones_keep_it() {
+        // `start()` spawns its loops from clones of `self`. Attaching the
+        // chunk sender afterwards leaves those clones holding `None`, which is
+        // how the finalization retry silently did nothing for a whole stress
+        // run — it logged every retry and enqueued none.
+        let mut coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
+
+        assert!(
+            coordinator.start().await.is_err(),
+            "start() must refuse to spawn background tasks without a chunk sender"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        coordinator.set_chunk_sender(tx);
+        coordinator.start().await.expect("start after wiring");
+
+        {
+            let mut state = coordinator.state.write().await;
+            state.inflight_chunks.insert(
+                "xt-clone".to_string(),
+                chunk_at(
+                    "xt-clone",
+                    ChunkStage::Aborted,
+                    Some(ChunkStage::WaitingForMessages),
+                ),
+            );
+        }
+
+        // A clone taken the way `start()` takes one must still be able to enqueue.
+        coordinator.clone().retry_unfinished_finalizations().await;
+        assert_eq!(rx.recv().await.unwrap(), "xt-clone");
+        // Not calling stop(): the cleanup and watchdog loops never return, so
+        // TaskTracker::wait would block forever. The runtime drops them.
+    }
+
+    #[tokio::test]
+    async fn unfinished_compensation_is_retried_and_eventually_abandoned() {
+        // A failed sendAbort leaves the chunk at Aborted with confirmed_stage
+        // behind. Nothing else ever wakes it — the publisher broadcasts each
+        // decision once — so the watchdog has to, or the user's escrowed
+        // tokens are never refunded.
+        let mut coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        coordinator.set_chunk_sender(tx);
+
+        {
+            let mut state = coordinator.state.write().await;
+            state.inflight_chunks.insert(
+                "xt-retry".to_string(),
+                chunk_at(
+                    "xt-retry",
+                    ChunkStage::Aborted,
+                    Some(ChunkStage::WaitingForMessages),
+                ),
+            );
+            // A chunk that did finish must not be retried.
+            state.inflight_chunks.insert(
+                "xt-done".to_string(),
+                chunk_at(
+                    "xt-done",
+                    ChunkStage::Confirmed,
+                    Some(ChunkStage::Confirmed),
+                ),
+            );
+        }
+
+        coordinator.retry_unfinished_finalizations().await;
+        assert_eq!(rx.recv().await.unwrap(), "xt-retry");
+        assert!(
+            rx.try_recv().is_err(),
+            "finished chunks must not be retried"
+        );
+
+        // Each failed attempt is counted, and retries stop at the cap.
+        for expected in 1..=MAX_FINALIZE_ATTEMPTS {
+            assert_eq!(
+                coordinator.record_finalize_failure("xt-retry").await,
+                expected
+            );
+        }
+
+        coordinator.retry_unfinished_finalizations().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "must stop retrying once the attempt cap is reached"
+        );
+    }
+
+    /// Pruning `inflight_chunks` must not take an unfinished chunk with it: an
+    /// unfinalized one is still owed a retry (or manual compensation), and a
+    /// missing entry makes the chunk processor re-register the instance from
+    /// scratch.
+    #[tokio::test]
+    async fn cleanup_only_drops_finished_chunks() {
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
+
+        {
+            let mut state = coordinator.state.write().await;
+            // Both instances aged out of `pending`; only one finalized.
+            for (id, confirmed_stage) in [
+                ("xt-done", Some(ChunkStage::Confirmed)),
+                ("xt-unfinalized", Some(ChunkStage::WaitingForMessages)),
+            ] {
+                state.inflight_chunks.insert(
+                    id.to_string(),
+                    TransactionChunk {
+                        instance_id: id.to_string(),
+                        stage: ChunkStage::Confirmed,
+                        confirmed_stage,
+                        ..Default::default()
+                    },
+                );
+                state
+                    .mailbox_messages
+                    .insert(id.to_string(), vec![MailboxMessage::default()]);
+            }
+        }
+
+        coordinator.cleanup(Duration::from_secs(300)).await;
+
+        let state = coordinator.state.read().await;
+        assert!(!state.inflight_chunks.contains_key("xt-done"));
+        assert!(!state.mailbox_messages.contains_key("xt-done"));
+        // Still owed a finalize, so both it and its removeInbox payload stay.
+        assert!(state.inflight_chunks.contains_key("xt-unfinalized"));
+        assert!(state.mailbox_messages.contains_key("xt-unfinalized"));
+    }
+
     #[tokio::test]
     async fn cleanup_removes_old_decided_xts() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-            VerificationConfig::default(),
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -647,16 +1336,8 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_removes_old_confirmed_xts() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-            VerificationConfig::default(),
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -680,16 +1361,8 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_retains_recently_confirmed_xts() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-            VerificationConfig::default(),
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -722,7 +1395,6 @@ mod tests {
             None,
             None,
             1000,
-            VerificationConfig::default(),
         );
 
         let mut txs = HashMap::new();
@@ -771,16 +1443,8 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_resolves_pending_submission_waiters() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-            VerificationConfig::default(),
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
         let (tx, rx) = oneshot::channel();
 
         {

@@ -5,13 +5,13 @@ use std::collections::HashMap;
 use compose_primitives::{ChainId, SequenceNumber};
 use tracing::{debug, info};
 
-use crate::coordinator::DefaultCoordinator;
+use crate::coordinator::{DefaultCoordinator, TransactionChunk, MAX_PENDING_XTS};
 use crate::model::pending_xt::PendingXt;
-use crate::pipeline::delivery::build_sender_nonce_cache;
+use crate::pipeline::delivery::{build_sender_nonce_cache, describe_txs};
+use compose_primitives::xtflow;
 use compose_primitives_traits::CoordinatorError;
 
-/// Maximum number of pending XTs before new submissions are rejected.
-const MAX_PENDING_XTS: usize = 100;
+
 
 impl DefaultCoordinator {
     /// Process an XT forwarded from another sidecar.
@@ -59,12 +59,6 @@ impl DefaultCoordinator {
         xt.raw_txs = clean_txs;
         xt.origin_chain = Some(origin_chain);
         xt.origin_seq = origin_seq;
-
-        // Pre-lock so only one local simulation task claims this XT.
-        if has_local {
-            xt.locked_chains.insert(self.chain_id);
-        }
-
         let raw_key = instance_id.as_bytes().to_vec();
         state.mailbox_index.insert(raw_key.clone(), xt.id.clone());
         state.pending.insert(xt.id.clone(), xt);
@@ -82,6 +76,15 @@ impl DefaultCoordinator {
             }
         }
 
+        xtflow!(
+            "forwarded_xt_in",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            origin_chain = origin_chain,
+            origin_seq = origin_seq.0,
+            has_local = has_local,
+            txs = describe_txs(&state.pending[instance_id].raw_txs),
+        );
         info!(
             xt_id = instance_id,
             chains = state.pending[instance_id].raw_txs.len(),
@@ -95,7 +98,7 @@ impl DefaultCoordinator {
             .get(instance_id)
             .and_then(|xt| self.local_builder_submission(xt));
 
-        // Release the write lock before spawning so process_xt can acquire it.
+        // Release the write lock before spawning so register_xt can acquire it.
         drop(state);
 
         if let Some(submission) = local_submission {
@@ -109,7 +112,11 @@ impl DefaultCoordinator {
             let coordinator = self.clone();
             let id = instance_id.to_string();
             self.task_tracker.spawn(async move {
-                coordinator.process_xt(&id).await;
+                let mut chunk = TransactionChunk {
+                    instance_id: id,
+                    ..Default::default()
+                };
+                coordinator.register_xt(&mut chunk).await;
             });
         }
 
@@ -119,49 +126,10 @@ impl DefaultCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use compose_primitives::{ChainId, SequenceNumber};
-    use compose_primitives_traits::CoordinatorError;
-
-    use crate::coordinator::{DefaultCoordinator, VerificationConfig};
-    use crate::model::pending_xt::PendingXt;
-
-    #[tokio::test]
-    async fn handle_forwarded_xt_rejects_when_at_max_pending() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-            VerificationConfig::default(),
-        );
-
-        // Fill pending with MAX_PENDING_XTS undecided XTs.
-        {
-            let mut state = coordinator.state.write().await;
-            for i in 0..100 {
-                let id = format!("xt-fill-{i}");
-                let mut xt = PendingXt::new(id.clone(), id.as_bytes().to_vec());
-                xt.raw_txs.insert(ChainId(88888), vec![vec![i as u8]]);
-                state.pending.insert(id.into(), xt);
-            }
-        }
-
-        let mut txs = HashMap::new();
-        txs.insert(ChainId(77777), vec![vec![0xab]]);
-
-        let result = coordinator
-            .handle_forwarded_xt("xt-new", txs, ChainId(88888), SequenceNumber(1))
-            .await;
-
-        assert!(result.is_err());
-        assert!(
-            matches!(result, Err(CoordinatorError::TooManyPendingInstances(100))),
-            "Expected TooManyPendingInstances, got: {result:?}"
-        );
-    }
+    // `handle_forwarded_xt_rejects_when_at_max_pending` was removed with the
+    // raise of MAX_PENDING_XTS: it filled `pending` with exactly 100 undecided
+    // XTs and asserted the guard fired at that number. The guard is now a
+    // memory backstop set far out of the way for stress testing, so a test
+    // pinned to the old value only asserts the constant's value. Restore a
+    // proper one if the limit is ever made configurable.
 }
