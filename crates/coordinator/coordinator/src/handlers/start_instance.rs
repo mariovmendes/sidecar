@@ -13,8 +13,6 @@ use crate::pipeline::submission::xt_request_fingerprint;
 use compose_primitives::xtflow;
 use compose_primitives_traits::CoordinatorError;
 
-
-
 impl DefaultCoordinator {
     /// Process a new instance from the publisher. Validates the period and
     /// sequence, decodes transactions, and registers the XT.
@@ -54,9 +52,16 @@ impl DefaultCoordinator {
         let mut state = self.state.write().await;
 
         if state.pending.contains_key(&instance_id) {
-            return Err(CoordinatorError::InstanceAlreadyPending(
-                instance_id.to_string(),
-            ));
+            // A re-submission of a byte-identical XT parks a fresh waiter on the
+            // same fingerprint, so a replayed or retransmitted start-instance can
+            // land here with someone still listening. Answering keeps it in line
+            // with every other early return below; staying silent would cost that
+            // caller the full submission timeout.
+            drop(state);
+            let error = CoordinatorError::InstanceAlreadyPending(instance_id.to_string());
+            self.resolve_pending_submission(&fingerprint, Err(error.to_string()))
+                .await;
+            return Err(error);
         }
 
         let undecided_count = state
@@ -211,14 +216,28 @@ impl DefaultCoordinator {
         if includes_local {
             let id = instance_id.to_string();
             if let Err(e) = sender.send(id.clone()).await {
-                xtflow!("signal_failed", instance_id = id, chain = self.chain_id, error = e);
+                xtflow!(
+                    "signal_failed",
+                    instance_id = id,
+                    chain = self.chain_id,
+                    error = e
+                );
                 error!(error = %e, instance_id = %id, "Failed to enqueue new instance, skipping XT processing");
             } else {
-                xtflow!("signal_enqueued", instance_id = id, chain = self.chain_id, from = "start_instance");
+                xtflow!(
+                    "signal_enqueued",
+                    instance_id = id,
+                    chain = self.chain_id,
+                    from = "start_instance"
+                );
                 info!(instance_id = %id, "New instance signalled to chunk processor");
             }
         } else {
-            xtflow!("not_local", instance_id = instance_id, chain = self.chain_id);
+            xtflow!(
+                "not_local",
+                instance_id = instance_id,
+                chain = self.chain_id
+            );
         }
 
         Ok(())
@@ -261,7 +280,9 @@ mod tests {
     use compose_proto::{StartInstance, TransactionRequest, XtRequest};
     use tokio::sync::mpsc;
 
-    use crate::coordinator::{DefaultCoordinator};
+    use crate::coordinator::DefaultCoordinator;
+    use crate::pipeline::submission::xt_request_fingerprint;
+    use compose_primitives_traits::CoordinatorError;
 
     fn start_instance(sequence_number: u64) -> StartInstance {
         StartInstance {
@@ -279,15 +300,8 @@ mod tests {
 
     #[tokio::test]
     async fn handle_start_instance_allows_multiple_local_xts() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -309,5 +323,44 @@ mod tests {
         let state = coordinator.state.read().await;
         assert_eq!(state.pending.len(), 2);
         assert_eq!(state.last_sequence_num.0, 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_instance_answers_a_parked_submitter() {
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
+
+        {
+            let mut state = coordinator.state.write().await;
+            state.period_initialized = true;
+            state.current_period_id = PeriodId(1);
+        }
+
+        let (tx, _rx) = mpsc::channel::<String>(300);
+        let msg = start_instance(1);
+        coordinator.handle_start_instance(&msg, &tx).await.unwrap();
+
+        // A re-submission of the identical XT parks a waiter on the same
+        // fingerprint after the first one was already resolved and removed.
+        let (waiter, mut parked) = tokio::sync::oneshot::channel();
+        let fingerprint = xt_request_fingerprint(msg.xt_request.as_ref().unwrap());
+        coordinator
+            .state
+            .write()
+            .await
+            .pending_submissions
+            .insert(fingerprint, vec![waiter]);
+
+        // The publisher replays the instance we already hold.
+        let err = coordinator
+            .handle_start_instance(&msg, &tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::InstanceAlreadyPending(_)));
+
+        // Answered immediately rather than left to hit the submission timeout.
+        // `try_recv` rather than `await`: unresolved, the sender stays alive in
+        // state and awaiting would hang instead of failing.
+        assert!(parked.try_recv().unwrap().is_err());
     }
 }

@@ -16,6 +16,7 @@ pub fn build_router(state: AppState) -> Router {
             "/ethera/confirm",
             post(handlers::ethera::handle_confirm_included),
         )
+        .route("/ethera/failed", post(handlers::ethera::handle_xt_failed))
         // XT endpoints
         .route("/xt", post(handlers::xt::handle_submit_xt))
         .route("/xt/:instance_id", get(handlers::xt::handle_get_xt_status))

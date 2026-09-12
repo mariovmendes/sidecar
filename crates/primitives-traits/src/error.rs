@@ -86,11 +86,25 @@ impl CoordinatorError {
 
     /// Whether the builder refused because it no longer knows the instance.
     ///
-    /// `ethera_abortXt` removes an instance together with every transaction of
-    /// it that had not executed yet, so an "unknown instance" answer means
-    /// there is nothing left on that chain to finalize or compensate — and
-    /// nothing a retry could change. Matched on the message because the RPC
-    /// reports it as a generic `InvalidParams` (-32602).
+    /// The builder forgets an instance in exactly two places, both via
+    /// `XtPool::remove_instance`: `ethera_abortXt`, and completion in
+    /// `mark_included` once `has_decision && all_included`. Completion is the
+    /// one that matters here, because `has_decision` is only ever set by a
+    /// successful `ethera_releaseXt`. So, an instance cannot finish and
+    /// disappear unless this sidecar's own release already went through. On a
+    /// retry, "unknown instance" therefore reads as *the finalize/compensate
+    /// already landed on chain*, which is why it is treated as done rather
+    /// than failed. Resubmitting would double-compensate.
+    ///
+    /// Note what it does *not* mean: `ethera_abortXt` is an in-memory forget
+    /// that cannot pull back transactions already executed, and an instance
+    /// whose transactions were included without a decision keeps
+    /// `has_decision == false` and stays in the pool. So "nothing executed" is
+    /// not a safe reading of this error.
+    ///
+    /// The ambiguous case is a builder restart, which drops the whole pool and
+    /// answers this way for instances that may have executed. Indistinguishable
+    /// from the others, the message is identical.
     pub fn is_unknown_instance(&self) -> bool {
         match self {
             Self::BuilderRejected { message, .. } => message.contains("unknown instance"),
@@ -112,6 +126,13 @@ impl CoordinatorError {
         let Self::BuilderRejected { message, .. } = self else {
             return None;
         };
+        // `expected ` alone is not a discriminator: any builder error may phrase
+        // itself that way, and `force_set` is destructive enough that it must
+        // only ever run on the one message that really carries the builder's
+        // answer.
+        if !message.contains("nonce gap") {
+            return None;
+        }
         let rest = message.split("expected ").nth(1)?;
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
         digits.parse().ok()
@@ -136,6 +157,15 @@ mod tests {
             message: "code -32602: unknown instance abc".to_string(),
         };
         assert_eq!(unknown.expected_nonce(), None);
+
+        // A non-nonce rejection that happens to say "expected N" must not be
+        // read as a nonce target: it would force_set the counter to 2.
+        let unrelated = CoordinatorError::BuilderRejected {
+            method: "ethera_releaseXt".to_string(),
+            message: "code -32602: invalid params: expected 2 arguments".to_string(),
+        };
+        assert_eq!(unrelated.expected_nonce(), None);
+
         assert_eq!(
             CoordinatorError::BuilderControl("connection reset".to_string()).expected_nonce(),
             None

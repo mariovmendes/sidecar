@@ -40,7 +40,7 @@ pub enum ChunkStage {
     WaitingForProcessing,
     WaitingForDecided,
     Confirmed,
-    Aborted
+    Aborted,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -338,6 +338,30 @@ impl DefaultCoordinator {
         for key in orphan_keys {
             state.mailbox_buffer.remove(&key);
         }
+        // Nothing else ever removes these two, so they grow for the process
+        // lifetime and are re-scanned by `stuck_scan` and
+        // `retry_unfinished_finalizations` every 10s.
+        //
+        // A chunk is only safe to drop once it is *finished*: `confirmed_stage`
+        // caught up to its terminal `stage`. One still short of that is either
+        // mid-retry or abandoned past `MAX_FINALIZE_ATTEMPTS` with escrow that
+        // may need manual compensation. Dropping either would erase the only
+        // record of it. Losing the chunk is also not neutral: the chunk
+        // processor treats a missing `inflight_chunks` entry as a *fresh*
+        // registration (main.rs's `None` arm), so a late signal for a pruned
+        // instance would re-run `register_xt` on an XT that already finished.
+        // Gating on `pending` is what makes that unreachable, every path that
+        // enqueues a signal resolves the instance through `pending` or
+        // `mailbox_index` (itself rebuilt from `pending` above) first.
+        let state = &mut *state;
+        state.inflight_chunks.retain(|id, chunk| {
+            chunk.confirmed_stage != Some(chunk.stage) || state.pending.contains_key(id.as_str())
+        });
+        // Kept alive by either side: `abort_xt` still reads a decided chunk's
+        // messages to rebuild its removeInbox payload.
+        state.mailbox_messages.retain(|id, _| {
+            state.pending.contains_key(id.as_str()) || state.inflight_chunks.contains_key(id)
+        });
         if let Some(m) = &self.metrics {
             m.mailbox_buffer_size.set(state.mailbox_buffer.len() as i64);
         }
@@ -505,7 +529,17 @@ impl DefaultCoordinator {
             mailbox_msgs: usize,
         }
 
-        let (undecided, unconfirmed, stuck_total, worst, pending_len, chunk_len, stages, period, last_seq) = {
+        let (
+            undecided,
+            unconfirmed,
+            stuck_total,
+            worst,
+            pending_len,
+            chunk_len,
+            stages,
+            period,
+            last_seq,
+        ) = {
             let state = self.state.read().await;
             let mut undecided = 0usize;
             let mut unconfirmed = 0usize;
@@ -1037,7 +1071,11 @@ mod tests {
             Ok(())
         }
 
-        async fn send_confirmed(&self, _instance_id: &[u8], _chain_id: u64 ) -> Result<(), CoordinatorError> {
+        async fn send_confirmed(
+            &self,
+            _instance_id: &[u8],
+            _chain_id: u64,
+        ) -> Result<(), CoordinatorError> {
             Ok(())
         }
 
@@ -1051,7 +1089,11 @@ mod tests {
         }
     }
 
-    fn chunk_at(instance_id: &str, stage: ChunkStage, confirmed: Option<ChunkStage>) -> TransactionChunk {
+    fn chunk_at(
+        instance_id: &str,
+        stage: ChunkStage,
+        confirmed: Option<ChunkStage>,
+    ) -> TransactionChunk {
         TransactionChunk {
             instance_id: instance_id.to_string(),
             stage,
@@ -1065,15 +1107,8 @@ mod tests {
         // Load shedding at the front door: past `throughput x deadline` in
         // flight, an accepted XT cannot reach a decision before the publisher
         // times it out, so refusing it protects the ones that still can.
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -1115,15 +1150,8 @@ mod tests {
         // The watchdog used to emit one line per stuck XT while holding the
         // state read lock — thousands per tick under overload, which stalled
         // every state mutation behind it.
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -1157,15 +1185,8 @@ mod tests {
         // chunk sender afterwards leaves those clones holding `None`, which is
         // how the finalization retry silently did nothing for a whole stress
         // run — it logged every retry and enqueued none.
-        let mut coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let mut coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         assert!(
             coordinator.start().await.is_err(),
@@ -1180,15 +1201,16 @@ mod tests {
             let mut state = coordinator.state.write().await;
             state.inflight_chunks.insert(
                 "xt-clone".to_string(),
-                chunk_at("xt-clone", ChunkStage::Aborted, Some(ChunkStage::WaitingForMessages)),
+                chunk_at(
+                    "xt-clone",
+                    ChunkStage::Aborted,
+                    Some(ChunkStage::WaitingForMessages),
+                ),
             );
         }
 
         // A clone taken the way `start()` takes one must still be able to enqueue.
-        coordinator
-            .clone()
-            .retry_unfinished_finalizations()
-            .await;
+        coordinator.clone().retry_unfinished_finalizations().await;
         assert_eq!(rx.recv().await.unwrap(), "xt-clone");
         // Not calling stop(): the cleanup and watchdog loops never return, so
         // TaskTracker::wait would block forever. The runtime drops them.
@@ -1200,15 +1222,8 @@ mod tests {
         // behind. Nothing else ever wakes it — the publisher broadcasts each
         // decision once — so the watchdog has to, or the user's escrowed
         // tokens are never refunded.
-        let mut coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let mut coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         coordinator.set_chunk_sender(tx);
 
@@ -1216,18 +1231,29 @@ mod tests {
             let mut state = coordinator.state.write().await;
             state.inflight_chunks.insert(
                 "xt-retry".to_string(),
-                chunk_at("xt-retry", ChunkStage::Aborted, Some(ChunkStage::WaitingForMessages)),
+                chunk_at(
+                    "xt-retry",
+                    ChunkStage::Aborted,
+                    Some(ChunkStage::WaitingForMessages),
+                ),
             );
             // A chunk that did finish must not be retried.
             state.inflight_chunks.insert(
                 "xt-done".to_string(),
-                chunk_at("xt-done", ChunkStage::Confirmed, Some(ChunkStage::Confirmed)),
+                chunk_at(
+                    "xt-done",
+                    ChunkStage::Confirmed,
+                    Some(ChunkStage::Confirmed),
+                ),
             );
         }
 
         coordinator.retry_unfinished_finalizations().await;
         assert_eq!(rx.recv().await.unwrap(), "xt-retry");
-        assert!(rx.try_recv().is_err(), "finished chunks must not be retried");
+        assert!(
+            rx.try_recv().is_err(),
+            "finished chunks must not be retried"
+        );
 
         // Each failed attempt is counted, and retries stop at the cap.
         for expected in 1..=MAX_FINALIZE_ATTEMPTS {
@@ -1244,17 +1270,51 @@ mod tests {
         );
     }
 
+    /// Pruning `inflight_chunks` must not take an unfinished chunk with it: an
+    /// unfinalized one is still owed a retry (or manual compensation), and a
+    /// missing entry makes the chunk processor re-register the instance from
+    /// scratch.
+    #[tokio::test]
+    async fn cleanup_only_drops_finished_chunks() {
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
+
+        {
+            let mut state = coordinator.state.write().await;
+            // Both instances aged out of `pending`; only one finalized.
+            for (id, confirmed_stage) in [
+                ("xt-done", Some(ChunkStage::Confirmed)),
+                ("xt-unfinalized", Some(ChunkStage::WaitingForMessages)),
+            ] {
+                state.inflight_chunks.insert(
+                    id.to_string(),
+                    TransactionChunk {
+                        instance_id: id.to_string(),
+                        stage: ChunkStage::Confirmed,
+                        confirmed_stage,
+                        ..Default::default()
+                    },
+                );
+                state
+                    .mailbox_messages
+                    .insert(id.to_string(), vec![MailboxMessage::default()]);
+            }
+        }
+
+        coordinator.cleanup(Duration::from_secs(300)).await;
+
+        let state = coordinator.state.read().await;
+        assert!(!state.inflight_chunks.contains_key("xt-done"));
+        assert!(!state.mailbox_messages.contains_key("xt-done"));
+        // Still owed a finalize, so both it and its removeInbox payload stay.
+        assert!(state.inflight_chunks.contains_key("xt-unfinalized"));
+        assert!(state.mailbox_messages.contains_key("xt-unfinalized"));
+    }
+
     #[tokio::test]
     async fn cleanup_removes_old_decided_xts() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -1276,15 +1336,8 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_removes_old_confirmed_xts() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -1308,15 +1361,8 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_retains_recently_confirmed_xts() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -1397,15 +1443,8 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_resolves_pending_submission_waiters() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
         let (tx, rx) = oneshot::channel();
 
         {

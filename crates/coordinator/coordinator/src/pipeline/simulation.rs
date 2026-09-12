@@ -16,7 +16,7 @@ use compose_mailbox::matching::matches_dependency;
 use compose_mailbox::overrides::merge_overrides;
 use compose_mailbox::wire;
 use compose_primitives::xtflow;
-use compose_primitives::{ChainId, CrossRollupDependency, StateOverride};
+use compose_primitives::{ChainId, CrossRollupDependency, SimulationResult, StateOverride};
 use compose_primitives_traits::{SendAbortEthParams, SendAbortTokenParams};
 use compose_proto::MailboxMessage;
 use compose_simulation::error::SimulationError;
@@ -87,8 +87,9 @@ impl BridgeCallArgs {
 }
 
 impl DefaultCoordinator {
-    /// Run the simulation pipeline for the local chain's portion of an XT.
-    ///
+    /// Classify the local chain's portion of an XT into roles, publish the
+    /// chunk, and — on the sender side — simulate the user's txs and submit
+    /// them to the builder.
     pub async fn register_xt(&self, transaction_chunk: &mut TransactionChunk) {
         xtflow!(
             "register_begin",
@@ -326,6 +327,40 @@ impl DefaultCoordinator {
                     .get("bridge")
                     .cloned();
                 if let Some(bridge_tx_bytes) = &bridge_tx_bytes {
+                    // Simulate the user's own txs before handing anything to the
+                    // builder: a revert here must vote false, and at this point
+                    // nothing is reserved so there is nothing to compensate.
+                    // Only feed `approve` to the simulator when it is actually
+                    // part of the submission, so the simulated prefix matches
+                    // what will execute.
+                    let Some(sim) = self
+                        .simulate_sender_txs(
+                            &simulator,
+                            transaction_chunk.instance_id.as_str(),
+                            if needs_approve {
+                                approve_tx_bytes.as_deref()
+                            } else {
+                                None
+                            },
+                            bridge_tx_bytes,
+                        )
+                        .await
+                    else {
+                        let _ = self
+                            .send_vote(transaction_chunk.instance_id.as_str(), false)
+                            .await;
+                        // Terminate the chunk rather than dropping it: a missing
+                        // inflight_chunks entry makes the chunk processor treat the
+                        // next signal as a fresh registration.
+                        transaction_chunk.stage = Aborted;
+                        transaction_chunk.confirmed_stage = Some(Aborted);
+                        self.state.write().await.inflight_chunks.insert(
+                            transaction_chunk.instance_id.clone(),
+                            transaction_chunk.clone(),
+                        );
+                        return;
+                    };
+
                     txs_to_submit.push(bridge_tx_bytes.clone());
                     let submitted = describe_local_txs(self.chain_id, &txs_to_submit);
                     xtflow!(
@@ -354,11 +389,9 @@ impl DefaultCoordinator {
                                 chain = self.chain_id,
                                 call = "ethera_submitXt",
                             );
-                            self.notify_outbound_dependency(
-                                &simulator,
+                            self.dispatch_outbound_messages(
                                 transaction_chunk.instance_id.as_str(),
-                                approve_tx_bytes.as_deref(),
-                                &bridge_tx_bytes,
+                                &sim,
                             )
                             .await;
                         }
@@ -389,27 +422,24 @@ impl DefaultCoordinator {
         }
     }
 
-    /// Simulate `approve` (if present) followed by the `bridge...To` call to
-    /// recover the `writeMessage` this XT will emit, and deliver it to the
-    /// destination chain's sidecar mailbox so it can be matched against the
-    /// recipient's receive call once that XT is processed there.
-    async fn notify_outbound_dependency(
+    /// Simulate the user's sender-side transactions — `approve` (when the
+    /// bridge call needs one) followed by the `bridge...To` call under the
+    /// approve's post-state — and return the bridge simulation on success.
+    ///
+    /// Returns `None` if either call reverts or the simulator itself fails.
+    /// This gates the vote, so it must run *before* anything is handed to the
+    /// builder: a revert here means `send_vote(false)` with nothing to
+    /// compensate. Fail closed — an unreachable RPC is treated like a revert.
+    ///
+    /// The returned result also carries the `writeMessage` this XT will emit,
+    /// which `dispatch_outbound_messages` delivers to the destination chain.
+    async fn simulate_sender_txs(
         &self,
         simulator: &std::sync::Arc<dyn compose_simulation::traits::Simulator>,
         instance_id: &str,
         approve_tx_bytes: Option<&[u8]>,
         bridge_tx_bytes: &[u8],
-    ) {
-        let Some(mailbox_sender) = &self.mailbox_sender else {
-            xtflow!(
-                "mailbox_out_skip",
-                instance_id = instance_id,
-                chain = self.chain_id,
-                reason = "no_mailbox_sender",
-            );
-            return;
-        };
-
+    ) -> Option<SimulationResult> {
         let mut overrides = StateOverride::default();
         if let Some(approve_tx_bytes) = approve_tx_bytes {
             match simulator
@@ -423,56 +453,78 @@ impl DefaultCoordinator {
                 }
                 Ok(result) => {
                     xtflow!(
-                        "mailbox_out_skip",
+                        "sim_reject",
                         instance_id = instance_id,
                         chain = self.chain_id,
-                        reason = "approve_simulation_failed",
+                        reason = "approve_reverted",
                         error = format!("{:?}", result.error),
                     );
-                    warn!(instance_id, error = ?result.error, "Approve simulation failed, skipping outbound ack");
-                    return;
+                    warn!(instance_id, error = ?result.error, "Approve simulation reverted, voting false");
+                    return None;
                 }
                 Err(e) => {
                     xtflow!(
-                        "mailbox_out_skip",
+                        "sim_reject",
                         instance_id = instance_id,
                         chain = self.chain_id,
-                        reason = "approve_simulation_error",
+                        reason = "approve_sim_error",
                         error = e,
                     );
-                    warn!(instance_id, error = %e, "Failed to simulate approve, skipping outbound ack");
-                    return;
+                    warn!(instance_id, error = %e, "Failed to simulate approve, voting false");
+                    return None;
                 }
             }
         }
 
-        let bridge_result = match simulator
+        match simulator
             .simulate(self.chain_id, bridge_tx_bytes, &overrides)
             .await
         {
-            Ok(result) if result.success => result,
+            Ok(result) if result.success => Some(result),
             Ok(result) => {
                 xtflow!(
-                    "mailbox_out_skip",
+                    "sim_reject",
                     instance_id = instance_id,
                     chain = self.chain_id,
-                    reason = "bridge_simulation_failed",
+                    reason = "bridge_reverted",
                     error = format!("{:?}", result.error),
                 );
-                warn!(instance_id, error = ?result.error, "Bridge simulation failed, skipping outbound ack");
-                return;
+                warn!(instance_id, error = ?result.error, "Bridge simulation reverted, voting false");
+                None
             }
             Err(e) => {
                 xtflow!(
-                    "mailbox_out_skip",
+                    "sim_reject",
                     instance_id = instance_id,
                     chain = self.chain_id,
-                    reason = "bridge_simulation_error",
+                    reason = "bridge_sim_error",
                     error = e,
                 );
-                warn!(instance_id, error = %e, "Failed to simulate bridge tx, skipping outbound ack");
-                return;
+                warn!(instance_id, error = %e, "Failed to simulate bridge tx, voting false");
+                None
             }
+        }
+    }
+
+    /// Deliver the `writeMessage` recovered by `simulate_sender_txs` to the
+    /// destination chain's sidecar mailbox, so it can be matched against the
+    /// recipient's receive call once that XT is processed there.
+    ///
+    /// Best-effort: a missing mailbox sender or a failed POST is logged, not
+    /// voted on — by this point the XT is already reserved in the builder.
+    async fn dispatch_outbound_messages(
+        &self,
+        instance_id: &str,
+        bridge_result: &SimulationResult,
+    ) {
+        let Some(mailbox_sender) = &self.mailbox_sender else {
+            xtflow!(
+                "mailbox_out_skip",
+                instance_id = instance_id,
+                chain = self.chain_id,
+                reason = "no_mailbox_sender",
+            );
+            return;
         };
 
         if bridge_result.outbound_messages.is_empty() {
@@ -895,6 +947,44 @@ impl DefaultCoordinator {
                         ..expected_dependency
                     };
 
+                    // Simulate the user's receive tx before reserving a nonce for
+                    // putInbox, so a revert costs no nonce reconciliation.
+                    // readMessage() would revert without putInbox having run, so
+                    // inject the inbox entry the message will occupy instead of
+                    // simulating the coordinator's own putInbox.
+                    if let Some(simulator) = &self.simulator {
+                        let outcome = simulator
+                            .simulate_with_mailbox(
+                                self.chain_id,
+                                &receive_tx_bytes,
+                                &StateOverride::default(),
+                                std::slice::from_ref(&dependency),
+                            )
+                            .await;
+                        let reject = match &outcome {
+                            Ok(result) if result.success => None,
+                            Ok(result) => Some(("receive_reverted", format!("{:?}", result.error))),
+                            Err(e) => Some(("receive_sim_error", e.to_string())),
+                        };
+                        if let Some((reason, error)) = reject {
+                            xtflow!(
+                                "process_reject",
+                                instance_id = transaction_chunk.instance_id,
+                                chain = self.chain_id,
+                                reason = reason,
+                                error = error,
+                            );
+                            warn!(
+                                transaction_chunk.instance_id,
+                                reason, error, "Receive tx simulation failed, voting false"
+                            );
+                            let _ = self
+                                .send_vote(transaction_chunk.instance_id.as_str(), false)
+                                .await;
+                            return;
+                        }
+                    }
+
                     let mut txs_to_submit: Vec<Vec<u8>> = Vec::new();
 
                     // putInbox must execute before the receive tx: readMessage()
@@ -1048,7 +1138,7 @@ impl DefaultCoordinator {
     /// Called right after a chunk reaches `WaitingForDecided`. A decision may
     /// have already raced ahead and been recorded on `xt.decision` by
     /// on_decision while this instance's own processing was still in
-    /// flight — since the publisher only broadcasts `Decided` once, nothing
+    /// flight. Since the publisher only broadcasts `Decided` once, nothing
     /// would ever come along afterwards to dispatch confirm_xt/abort_xt for
     /// it, leaving the chunk stuck at `WaitingForDecided` forever. Check for
     /// that here and, if the decision is already known, finalize/compensate
@@ -1106,12 +1196,16 @@ impl DefaultCoordinator {
                         transaction_chunk.instance_id,
                         "No bridge tx recorded for sender confirm, dropping"
                     );
+                    self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Confirmed)
+                        .await;
                     return;
                 };
                 let args = match Self::decode_bridge_call_args(bridge_tx_bytes) {
                     Ok(args) => args,
                     Err(e) => {
                         warn!(transaction_chunk.instance_id, error = %e, "Failed to decode bridge tx for confirm, dropping");
+                        self.note_finalize_failure(transaction_chunk, "sendConfirm")
+                            .await;
                         return;
                     }
                 };
@@ -1120,6 +1214,8 @@ impl DefaultCoordinator {
                         transaction_chunk.instance_id,
                         "No l2 bridge builder configured, dropping confirm"
                     );
+                    self.note_finalize_failure(transaction_chunk, "sendConfirm")
+                        .await;
                     return;
                 };
                 let header = CrossRollupDependency {
@@ -1169,12 +1265,19 @@ impl DefaultCoordinator {
                         transaction_chunk.instance_id,
                         "No receive tx recorded for receiver confirm, dropping"
                     );
+                    self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Confirmed)
+                        .await;
                     return;
                 };
                 let header = match Self::decode_receive_header(receive_tx_bytes) {
                     Ok(h) => h,
                     Err(e) => {
                         warn!(transaction_chunk.instance_id, error = %e, "Failed to decode receive tx for confirm, dropping");
+                        self.mark_confirmed_stage(
+                            transaction_chunk.instance_id.as_str(),
+                            Confirmed,
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -1192,6 +1295,8 @@ impl DefaultCoordinator {
                             transaction_chunk.instance_id,
                             "Receive tx selector not recognised for confirm, dropping"
                         );
+                        self.note_finalize_failure(transaction_chunk, "recvConfirm")
+                            .await;
                         return;
                     }
                 };
@@ -1227,6 +1332,8 @@ impl DefaultCoordinator {
                     transaction_chunk.instance_id,
                     "Chunk missing is_sender at confirm, dropping"
                 );
+                self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Confirmed)
+                    .await;
             }
         }
     }
@@ -1296,12 +1403,22 @@ impl DefaultCoordinator {
                                         transaction_chunk.instance_id,
                                         "No receive tx recorded for receiver abort, dropping"
                                     );
+                                    self.mark_confirmed_stage(
+                                        transaction_chunk.instance_id.as_str(),
+                                        Aborted,
+                                    )
+                                    .await;
                                     return;
                                 };
                                 let header = match Self::decode_receive_header(receive_tx_bytes) {
                                     Ok(h) => h,
                                     Err(e) => {
                                         warn!(transaction_chunk.instance_id, error = %e, "Failed to decode receive tx for abort, dropping");
+                                        self.mark_confirmed_stage(
+                                            transaction_chunk.instance_id.as_str(),
+                                            Aborted,
+                                        )
+                                        .await;
                                         return;
                                     }
                                 };
@@ -1356,23 +1473,30 @@ impl DefaultCoordinator {
                                     }
                                     None => {
                                         warn!(transaction_chunk.instance_id, "Receive tx selector not recognised for abort, dropping");
+                                        self.mark_confirmed_stage(
+                                            transaction_chunk.instance_id.as_str(),
+                                            Aborted,
+                                        )
+                                        .await;
                                         return;
                                     }
                                 };
 
                                 if let Err(e) = result {
                                     if e.is_unknown_instance() {
-                                        // Already dropped at the builder along
-                                        // with its un-executed transactions —
-                                        // nothing to compensate, and no retry
-                                        // can change that.
+                                        // Same as the sender side: the builder
+                                        // only forgets an instance on an
+                                        // explicit abort or on completion, and
+                                        // completion implies our own
+                                        // `recvAbort` was already released and
+                                        // included. Done, not failed.
                                         xtflow!(
                                             "abort_not_applicable",
                                             instance_id = transaction_chunk.instance_id,
                                             chain = self.chain_id,
                                             side = "receiver",
                                             call = "recvAbort",
-                                            reason = "instance already dropped at builder",
+                                            reason = "builder no longer holds instance; compensation already included",
                                         );
                                         self.mark_confirmed_stage(
                                             transaction_chunk.instance_id.as_str(),
@@ -1409,7 +1533,6 @@ impl DefaultCoordinator {
                     }
                     None => {}
                 }
-
                 self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Aborted)
                     .await;
             }
@@ -1418,6 +1541,8 @@ impl DefaultCoordinator {
                     transaction_chunk.instance_id,
                     "Chunk missing is_sender at abort, dropping"
                 );
+                self.mark_confirmed_stage(transaction_chunk.instance_id.as_str(), Aborted)
+                    .await;
             }
         }
     }
@@ -1489,18 +1614,21 @@ impl DefaultCoordinator {
 
         if let Err(e) = result {
             if e.is_unknown_instance() {
-                // The instance was already dropped at the builder (a period
-                // tick aborts it there and locally at the same time), taking
-                // its un-executed transactions with it. There is no escrow
-                // left to refund, so this is done, not failed — retrying would
-                // only repeat the same rejection and raise a false alarm.
+                // The builder no longer holds the instance, which (outside a
+                // builder restart) means an earlier `sendAbort` of ours was
+                // released and included. Completion is the only way an
+                // instance is forgotten without an explicit abort, and it
+                // requires a decision entry that only `releaseXt` creates. So
+                // the compensation is already on chain: done, not failed.
+                // Retrying would repeat the rejection, and resubmitting the
+                // transaction outside the instance would refund twice.
                 xtflow!(
                     "abort_not_applicable",
                     instance_id = transaction_chunk.instance_id,
                     chain = self.chain_id,
                     side = "sender",
                     call = "sendAbort",
-                    reason = "instance already dropped at builder",
+                    reason = "builder no longer holds instance; compensation already included",
                 );
                 return Compensation::NotApplicable;
             }
@@ -1834,7 +1962,7 @@ mod tests {
     use alloy::signers::SignerSync;
     use alloy::sol_types::SolCall;
     use async_trait::async_trait;
-    use compose_mailbox::contract::{receiveETHCall, MessageHeader};
+    use compose_mailbox::contract::{bridgeEthToCall, receiveETHCall, MessageHeader};
     use compose_mailbox::wire;
     use compose_primitives::ChainId;
     use compose_primitives::StateOverride;
@@ -1845,6 +1973,7 @@ mod tests {
     use compose_simulation::traits::Simulator;
     use std::sync::{Arc, Mutex};
 
+    use crate::coordinator::ChunkStage::Aborted;
     use crate::coordinator::{DefaultCoordinator, TransactionChunk};
     use crate::model::pending_xt::PendingXt;
 
@@ -2010,9 +2139,29 @@ mod tests {
         assert_eq!(xt.decision, Some(false));
     }
 
-    /// Simple stub simulator for testing: always returns success or always fails.
+    /// Simple stub simulator for testing. `succeed: false` models the simulator
+    /// itself failing (unreachable RPC); `revert: true` models the tx simulating
+    /// cleanly but reverting. Both must vote false.
+    #[derive(Default)]
     struct StubSimulator {
         succeed: bool,
+        revert: bool,
+    }
+
+    impl StubSimulator {
+        fn ok() -> Self {
+            Self {
+                succeed: true,
+                revert: false,
+            }
+        }
+
+        fn reverting() -> Self {
+            Self {
+                succeed: true,
+                revert: true,
+            }
+        }
     }
 
     #[async_trait]
@@ -2023,17 +2172,16 @@ mod tests {
             _tx: &[u8],
             _state_overrides: &StateOverride,
         ) -> Result<SimulationResult, SimulationError> {
-            if self.succeed {
-                Ok(SimulationResult {
-                    success: true,
-                    error: None,
-                    state_overrides: None,
-                    dependencies: Vec::new(),
-                    outbound_messages: Vec::new(),
-                })
-            } else {
-                Err(SimulationError::Failed("stub failure".to_string()))
+            if !self.succeed {
+                return Err(SimulationError::Failed("stub failure".to_string()));
             }
+            Ok(SimulationResult {
+                success: !self.revert,
+                error: self.revert.then(|| "stub revert".to_string()),
+                state_overrides: None,
+                dependencies: Vec::new(),
+                outbound_messages: Vec::new(),
+            })
         }
 
         async fn simulate_with_mailbox(
@@ -2069,7 +2217,7 @@ mod tests {
         let builder_client = Arc::new(RecordingBuilderClient::default());
         let mut coordinator = DefaultCoordinator::new(
             ChainId(77777),
-            Some(Arc::new(StubSimulator { succeed: true })),
+            Some(Arc::new(StubSimulator::ok())),
             None,
             None,
             None,
@@ -2120,11 +2268,132 @@ mod tests {
         assert_eq!(xt.local_vote, Some(true));
     }
 
+    /// Receiver side: the SEND message matches, but the user's receive tx
+    /// reverts in simulation. The gate must fire before the putInbox nonce is
+    /// reserved, so nothing reaches the builder and the vote is false.
+    #[tokio::test]
+    async fn process_xt_votes_false_when_receive_simulation_reverts() {
+        let sender = Address::repeat_byte(0x33);
+        let receiver = Address::repeat_byte(0x44);
+        let receive_tx = signed_tx(receiveETHCall {
+            msgHeader: MessageHeader {
+                chainSrc: U256::from(88888u64),
+                chainDest: U256::from(77777u64),
+                sender,
+                receiver,
+                sessionId: U256::from(9u64),
+                label: "SEND_ETH".to_string(),
+            },
+        });
+
+        let builder_client = Arc::new(RecordingBuilderClient::default());
+        let mut coordinator = DefaultCoordinator::new(
+            ChainId(77777),
+            Some(Arc::new(StubSimulator::reverting())),
+            None,
+            None,
+            None,
+            None,
+            1000,
+        );
+        coordinator.set_xt_builder_client(builder_client.clone());
+        coordinator.set_put_inbox_builder(Arc::new(TestPutInboxBuilder));
+
+        {
+            let mut state = coordinator.state.write().await;
+            let mut xt = PendingXt::new("xt-77777-11".to_string(), b"xt-77777-11".to_vec());
+            xt.raw_txs.insert(ChainId(77777), vec![receive_tx]);
+            state.pending.insert(xt.id.clone(), xt);
+            state.mailbox_messages.insert(
+                "xt-77777-11".to_string(),
+                vec![MailboxMessage {
+                    instance_id: b"xt-77777-11".to_vec(),
+                    source_chain: 88888,
+                    destination_chain: 77777,
+                    sender: sender.as_slice().to_vec(),
+                    receiver: receiver.as_slice().to_vec(),
+                    label: "SEND_ETH".to_string(),
+                    payload: vec![1, 2, 3],
+                    session_id: wire::encode_session_id(U256::from(9u64)),
+                }],
+            );
+        }
+
+        coordinator
+            .register_xt(&mut TransactionChunk {
+                instance_id: "xt-77777-11".to_string(),
+                ..Default::default()
+            })
+            .await;
+
+        assert!(
+            builder_client.submitted.lock().unwrap().is_empty(),
+            "a reverting receive tx must never be bundled to the builder"
+        );
+        let state = coordinator.state.read().await;
+        assert_eq!(
+            state.pending.get("xt-77777-11").unwrap().local_vote,
+            Some(false)
+        );
+    }
+
+    /// Sender side: the user's bridge tx fails to simulate, so the XT is voted
+    /// down and never submitted, and the chunk is terminated rather than left
+    /// for the processor to re-register.
+    #[tokio::test]
+    async fn register_xt_votes_false_when_bridge_simulation_fails() {
+        let bridge_tx = signed_tx(bridgeEthToCall {
+            sessionId: U256::from(7u64),
+            chainDest: U256::from(88888u64),
+            receiver: Address::repeat_byte(0x44),
+        });
+
+        let builder_client = Arc::new(RecordingBuilderClient::default());
+        let mut coordinator = DefaultCoordinator::new(
+            ChainId(77777),
+            Some(Arc::new(StubSimulator::default())),
+            None,
+            None,
+            None,
+            None,
+            1000,
+        );
+        coordinator.set_xt_builder_client(builder_client.clone());
+
+        {
+            let mut state = coordinator.state.write().await;
+            let mut xt = PendingXt::new("xt-77777-12".to_string(), b"xt-77777-12".to_vec());
+            xt.raw_txs.insert(ChainId(77777), vec![bridge_tx]);
+            state.pending.insert(xt.id.clone(), xt);
+        }
+
+        let mut chunk = TransactionChunk {
+            instance_id: "xt-77777-12".to_string(),
+            ..Default::default()
+        };
+        coordinator.register_xt(&mut chunk).await;
+
+        assert!(
+            builder_client.submitted.lock().unwrap().is_empty(),
+            "an unsimulatable bridge tx must never reach the builder"
+        );
+        assert_eq!(chunk.stage, Aborted);
+        assert_eq!(chunk.confirmed_stage, Some(Aborted));
+
+        let state = coordinator.state.read().await;
+        assert_eq!(
+            state.pending.get("xt-77777-12").unwrap().local_vote,
+            Some(false)
+        );
+        let stored = state.inflight_chunks.get("xt-77777-12").unwrap();
+        assert_eq!(stored.confirmed_stage, Some(Aborted));
+    }
+
     /// A raw tx that is not a decodable envelope is rejected before the
     /// simulator or the mailbox are ever consulted.
     #[tokio::test]
     async fn register_xt_votes_false_on_undecodable_tx() {
-        let simulator = Arc::new(StubSimulator { succeed: true });
+        let simulator = Arc::new(StubSimulator::ok());
         let coordinator = DefaultCoordinator::new(
             ChainId(77777),
             Some(simulator),
@@ -2152,6 +2421,38 @@ mod tests {
         let state = coordinator.state.read().await;
         let xt = state.pending.get("xt-77777-11").unwrap();
         assert_eq!(xt.local_vote, Some(false));
+    }
+
+    /// A chunk that can never be finalized (no bridge tx to build the confirm
+    /// from) must still reach `confirmed_stage`, or the watchdog re-dispatches
+    /// it every tick forever without ever counting an attempt.
+    #[tokio::test]
+    async fn confirm_marks_unfinalizable_chunk_instead_of_looping() {
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
+
+        let mut chunk = TransactionChunk {
+            instance_id: "xt-77777-13".to_string(),
+            stage: crate::coordinator::ChunkStage::Confirmed,
+            is_sender: Some(true),
+            ..Default::default()
+        };
+        coordinator
+            .state
+            .write()
+            .await
+            .inflight_chunks
+            .insert(chunk.instance_id.clone(), chunk.clone());
+
+        coordinator.confirm_xt(&mut chunk).await;
+
+        let state = coordinator.state.read().await;
+        let stored = state.inflight_chunks.get("xt-77777-13").unwrap();
+        assert_eq!(
+            stored.confirmed_stage,
+            Some(crate::coordinator::ChunkStage::Confirmed)
+        );
+        assert_eq!(stored.finalize_attempts, 0);
     }
 
     #[tokio::test]

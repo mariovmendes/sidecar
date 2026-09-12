@@ -40,6 +40,11 @@ pub struct SidecarMetrics {
     pub xt_rejected_total: Counter<u64>,
     /// Current number of orphan mailbox buffer entries.
     pub mailbox_buffer_size: Gauge,
+    /// Transactions the builder's EVM refused outright — no gas money, fee cap
+    /// below base fee, nonce already consumed. The builder has quarantined the
+    /// instance and will not retry it, so every increment is a cross-chain
+    /// round that cannot make progress without intervention.
+    pub xt_unrecoverable_total: Counter<u64>,
 }
 
 impl SidecarMetrics {
@@ -174,6 +179,13 @@ impl SidecarMetrics {
             mailbox_buffer_size.clone(),
         );
 
+        let xt_unrecoverable_total = Counter::default();
+        registry.register(
+            "sidecar_xt_unrecoverable",
+            "Transactions the builder's EVM refused outright, quarantining the instance",
+            xt_unrecoverable_total.clone(),
+        );
+
         Self {
             xt_received_total,
             xt_decided_commit_total,
@@ -191,6 +203,7 @@ impl SidecarMetrics {
             put_inbox_build_error_total,
             xt_rejected_total,
             mailbox_buffer_size,
+            xt_unrecoverable_total,
         }
     }
 }

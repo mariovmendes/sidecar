@@ -256,8 +256,7 @@ impl DefaultCoordinator {
     /// A nonce-gap rejection carries the builder's own expected value, and that
     /// answer wins: snapping to it repairs the desync on the next attempt no
     /// matter how it arose. Recycling the refused nonce instead would re-offer
-    /// the same rejected value forever — the livelock that left 1,565 aborted
-    /// XTs uncompensated. Any other rejection means the transaction never
+    /// the same rejected value forever. Any other rejection means the transaction never
     /// entered the pool, so its nonce is simply handed back.
     pub(crate) async fn reconcile_nonce_after_rejection(
         &self,
@@ -675,6 +674,98 @@ impl DefaultCoordinator {
         Self::remove_pending_xt_from_state(&mut state, instance_id)
     }
 
+    /// Handle `POST /ethera/failed`: the builder's EVM refused a transaction
+    /// in `instance_id` and has quarantined the instance.
+    ///
+    /// The builder has stopped *selecting* the instance but has deliberately
+    /// not forgotten it — retiring it is ours to do, because
+    /// [`CoordinatorError::is_unknown_instance`] reads a forgotten instance as
+    /// proof that our own compensation already landed.
+    ///
+    /// The instance is always aborted, whether or not part of it executed.
+    /// The round is lost either way, and the reservations it holds are not
+    /// only its own problem: the coordinator signs into every instance, so a
+    /// coordinator nonce left stuck here stalls *every* later cross-chain
+    /// round on this chain. The round is dead; the chain still has to move.
+    ///
+    /// `executed` lists the transactions of this instance that ran before the
+    /// refusal. It does not change the decision, only what the failure means:
+    ///
+    /// - **Empty** — nothing reached the chain, so no funds are escrowed (the
+    ///   same reasoning as `Compensation::NotApplicable`).
+    /// - **Non-empty** — part of the round is on chain and the rest can never
+    ///   execute. That state is already out of sync with the counterpart
+    ///   chain and no replay repairs it, so there is no compensation to run.
+    ///   A later `release_xt` will return `UnknownInstance` and the decision
+    ///   pipeline will treat the round as settled, which is the right outcome
+    ///   here — logged separately so the case stays visible rather than
+    ///   silently inferred.
+    ///
+    /// Nonces are not recycled explicitly. After the abort the builder no
+    /// longer reserves them, so its `true_next_nonce` falls back to the hole
+    /// and the next submission is refused with a nonce gap carrying the
+    /// builder's own expected value — which `reconcile_nonce_after_rejection`
+    /// turns into a `force_set`. That repair uses the builder's answer instead
+    /// of our guess, so it cannot recycle a nonce that actually executed.
+    pub async fn handle_failed_xt(
+        &self,
+        instance_id: &str,
+        executed: &[String],
+        reason: &str,
+    ) -> Result<(), CoordinatorError> {
+        if let Some(metrics) = &self.metrics {
+            metrics.xt_unrecoverable_total.inc();
+        }
+
+        xtflow!(
+            "builder_unrecoverable",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            executed = executed.len(),
+            partial = !executed.is_empty(),
+            reason = reason,
+        );
+
+        let Some(builder) = &self.xt_builder_client else {
+            error!(
+                instance_id = %instance_id,
+                executed = executed.len(),
+                %reason,
+                "Builder reported an unrecoverable XT but no builder client is configured; \
+                 its nonce reservations cannot be released"
+            );
+            return Ok(());
+        };
+
+        if executed.is_empty() {
+            error!(
+                instance_id = %instance_id,
+                %reason,
+                "Builder quarantined an XT that never reached the chain; aborting it"
+            );
+        } else {
+            error!(
+                instance_id = %instance_id,
+                executed = executed.len(),
+                %reason,
+                "Builder quarantined a partially executed XT; the round is unrecoverable \
+                 and this chain's state now diverges from its counterpart. Aborting to \
+                 release the nonces it holds"
+            );
+        }
+
+        builder.abort_xt(instance_id).await?;
+        xtflow!(
+            "builder_unrecoverable_aborted",
+            instance_id = instance_id,
+            chain = self.chain_id,
+            executed = executed.len(),
+            partial = !executed.is_empty(),
+        );
+
+        Ok(())
+    }
+
     pub async fn confirm_included_xts(
         &self,
         instance_ids: &[String],
@@ -815,15 +906,8 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_included_xts_keeps_pending_for_status_polling() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
 
         {
             let mut state = coordinator.state.write().await;
@@ -854,15 +938,8 @@ mod tests {
 
     #[test]
     fn local_builder_submission_prefers_publisher_sequence() {
-        let coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
         let mut xt = PendingXt::new("xt-77777-2".to_string(), b"xt-77777-2".to_vec());
         xt.period_id = PeriodId(11);
         xt.sequence_num = SequenceNumber(7);
@@ -877,15 +954,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_put_inbox_transactions_uses_canonical_nonce_source() {
-        let mut coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let mut coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
         let builder = Arc::new(TestPutInboxBuilder::new(7));
         coordinator.set_put_inbox_builder(builder.clone());
 
@@ -923,15 +993,8 @@ mod tests {
         // already taken the nonces above it. Unless the rejected nonce is
         // handed back, the builder's coordinator cursor stops there and every
         // later cross-chain transaction on the chain is stuck behind it.
-        let mut coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let mut coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
         coordinator.set_put_inbox_builder(Arc::new(TestPutInboxBuilder::new(20)));
 
         let (_, first) = coordinator
@@ -961,15 +1024,8 @@ mod tests {
 
     #[tokio::test]
     async fn monotonic_resync_keeps_locally_reserved_put_inbox_nonce() {
-        let mut coordinator = DefaultCoordinator::new(
-            ChainId(77777),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        );
+        let mut coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
         let builder = Arc::new(TestPutInboxBuilder::new(7));
         coordinator.set_put_inbox_builder(builder.clone());
 
@@ -991,5 +1047,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(transactions, vec![9_u64.to_be_bytes().to_vec()]);
+    }
+
+    #[derive(Debug, Default)]
+    struct AbortRecordingBuilderClient {
+        aborted: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl compose_primitives_traits::XtBuilderClient for AbortRecordingBuilderClient {
+        async fn submit_locked_xt(
+            &self,
+            _instance_id: &str,
+            _period_id: u64,
+            _sequence_number: u64,
+            _transactions: Vec<Vec<u8>>,
+        ) -> Result<(), CoordinatorError> {
+            Ok(())
+        }
+
+        async fn submit_tx(&self, _tx: &[u8]) -> Result<(), CoordinatorError> {
+            Ok(())
+        }
+
+        async fn submit_followup_xt(
+            &self,
+            _instance_id: &str,
+            _put_inbox_transactions: Vec<Vec<u8>>,
+        ) -> Result<(), CoordinatorError> {
+            Ok(())
+        }
+
+        async fn release_xt(
+            &self,
+            _instance_id: &str,
+            _put_inbox_transactions: Vec<Vec<u8>>,
+        ) -> Result<(), CoordinatorError> {
+            Ok(())
+        }
+
+        async fn abort_xt(&self, instance_id: &str) -> Result<(), CoordinatorError> {
+            self.aborted.lock().await.push(instance_id.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_xt_that_never_reached_the_chain_is_aborted() {
+        // Nothing executed, so no funds are escrowed and the round cannot
+        // proceed. Aborting is what releases the nonces the builder is still
+        // holding for it.
+        let mut coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
+        let builder = Arc::new(AbortRecordingBuilderClient::default());
+        coordinator.set_xt_builder_client(builder.clone());
+
+        coordinator
+            .handle_failed_xt("xt-77777-1", &[], "EVM refused a transaction")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            builder.aborted.lock().await.as_slice(),
+            ["xt-77777-1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn partially_executed_unrecoverable_xt_is_also_aborted() {
+        // Part of this round is on chain and the rest can never execute, so
+        // the round is lost and no compensation applies. The abort still has
+        // to happen: the coordinator signs into every instance, so a nonce
+        // left stuck here would stall every later cross-chain round.
+        let mut coordinator =
+            DefaultCoordinator::new(ChainId(77777), None, None, None, None, None, 1000);
+        let builder = Arc::new(AbortRecordingBuilderClient::default());
+        coordinator.set_xt_builder_client(builder.clone());
+
+        coordinator
+            .handle_failed_xt(
+                "xt-77777-2",
+                &["0xdeadbeef".to_string()],
+                "EVM refused a transaction",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            builder.aborted.lock().await.as_slice(),
+            ["xt-77777-2".to_string()],
+            "a stuck coordinator nonce must be released even when the round is lost"
+        );
     }
 }

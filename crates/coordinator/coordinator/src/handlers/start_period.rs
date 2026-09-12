@@ -1,11 +1,13 @@
 //! Start-period handling and period state transitions.
 
-use compose_primitives::{PeriodId, SuperblockNumber};
+use compose_primitives::{InstanceId, PeriodId, SuperblockNumber};
+use std::time::Duration;
 use tracing::{error, info};
 
 use crate::coordinator::DefaultCoordinator;
-use compose_primitives::xtflow;
 use compose_primitives_traits::CoordinatorError;
+
+const STALE_AFTER: Duration = Duration::from_secs(20);
 
 impl DefaultCoordinator {
     /// Handle a new period from the publisher. Aborts any stale undecided
@@ -16,22 +18,20 @@ impl DefaultCoordinator {
         period_id: PeriodId,
         superblock_num: SuperblockNumber,
     ) -> Result<(), CoordinatorError> {
-        let (aborted_instance_ids, builder_abort_ids): (Vec<Vec<u8>>, Vec<String>) = {
+        let (aborted_instance_ids, stale_ids): (Vec<Vec<u8>>, Vec<InstanceId>) = {
             let mut state = self.state.write().await;
 
             let mut aborted_ids = Vec::new();
-            let mut builder_abort_ids = Vec::new();
-            for xt in state.pending.values_mut() {
+            let mut stale_ids = Vec::new();
+            for xt in state.pending.values() {
                 if xt.decision.is_some() || xt.period_id.0 == 0 || xt.period_id >= period_id {
                     continue;
                 }
-                aborted_ids.push(xt.instance_id.clone());
-                if let Some(super::builder_control::XtBuilderCommand::Abort { instance_id }) =
-                    self.local_builder_command(xt, false)
-                {
-                    builder_abort_ids.push(instance_id);
+                if xt.created_at.elapsed() < STALE_AFTER {
+                    continue;
                 }
-                xt.record_decision(false);
+                aborted_ids.push(xt.instance_id.clone());
+                stale_ids.push(xt.id.clone());
             }
 
             state.current_period_id = period_id;
@@ -48,41 +48,27 @@ impl DefaultCoordinator {
                 "Started new period"
             );
 
-            (aborted_ids, builder_abort_ids)
+            (aborted_ids, stale_ids)
         }; // write lock released before async operations
 
-        for instance_id in &builder_abort_ids {
-            self.apply_builder_command(super::builder_control::XtBuilderCommand::Abort {
-                instance_id: instance_id.clone(),
-            })
-            .await?;
+        // Abort through the normal decision path rather than dropping the
+        // instance at the builder directly: `on_decision` records the abort,
+        // moves any existing chunk to `Aborted` and hands the id to the chunk
+        // processor, which is what actually runs `abort_xt` and puts the
+        // compensation on chain. Marking the decision here without signalling
+        // would strand a chunk past `WaitingForMessages` at `WaitingForDecided`
+        // forever. As such, the finalize watchdog only looks at terminal stages.
+        //
+        // Logged and skipped rather than propagated: one stale instance that
+        // cannot be aborted must not stop the period from starting.
+        for id in &stale_ids {
+            if let Err(e) = self.on_decision(id.as_str(), false).await {
+                error!(instance_id = %id, error = %e, "Failed to abort stale XT on period change");
+            }
         }
 
-        if builder_abort_ids.is_empty() {
-            if let Err(e) = self.resync_put_inbox_nonce_monotonic().await {
-                error!(error = %e, "Failed to resync putInbox nonce on period change");
-                self.nonce_manager.reset().await;
-            }
-        } else {
-            // `ethera_abortXt` drops the instance *and its reservations*, so
-            // the builder just handed back coordinator nonces that this
-            // sidecar already considers spent — including, in the worst case,
-            // one whose transaction it had already accepted. The monotonic
-            // resync cannot follow that downwards, and the recycling only
-            // covers nonces the builder explicitly rejected, so the two views
-            // would stay one apart forever and every later submission would be
-            // refused for a nonce gap. Drop the counter instead and let the
-            // next reservation re-read the builder's own expectation.
-            //
-            // ponytail: a reservation that is built but not yet submitted when
-            // this runs is invisible to the builder's pending count, so its
-            // nonce can be handed out twice; the duplicate is refused, recycled
-            // and retried. Track in-flight reservations if that shows up.
-            xtflow!(
-                "nonce_reset_after_abort",
-                chain = self.chain_id,
-                aborted_instances = builder_abort_ids.len(),
-            );
+        if let Err(e) = self.resync_put_inbox_nonce_monotonic().await {
+            error!(error = %e, "Failed to resync putInbox nonce on period change");
             self.nonce_manager.reset().await;
         }
 
